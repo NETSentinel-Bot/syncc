@@ -101,7 +101,7 @@ export async function ProtocolOverWSHandler(request, config) {
     .pipeTo(
       new WritableStream({
         async write(chunk, controller) {
-          if (udpStreamWriter) return udpStreamWriter.write(chunk);
+          if (udpStreamWriter) return udpStreamWriter(chunk);
           if (remoteSocketWapper.value) {
             const writer = remoteSocketWapper.value.writable.getWriter();
             try {
@@ -126,7 +126,7 @@ export async function ProtocolOverWSHandler(request, config) {
             if (header.port_remote === 53) {
               const dnsPipeline = await createDnsPipeline(webSocket, vlessResponseHeader, log);
               udpStreamWriter = dnsPipeline.write;
-              udpStreamWriter(rawClientData);
+              await udpStreamWriter(rawClientData);
             } else {
               log(`udp:${header.port_remote} not supported (dns-only), closing gently`);
               safeCloseWebSocket(webSocket);
@@ -183,10 +183,9 @@ async function HandleTCPOutBound(
 
     remoteSocket.value = tcpSocket;
 
+    const writer = tcpSocket.writable.getWriter();
     try {
-      const writer = tcpSocket.writable.getWriter();
       await writer.write(rawClientData);
-      writer.releaseLock();
       log(`connected to ${formattedHost}:${port}`);
       return tcpSocket;
     } catch (error) {
@@ -195,6 +194,8 @@ async function HandleTCPOutBound(
       } catch {}
       remoteSocket.value = null;
       throw error;
+    } finally {
+      writer.releaseLock();
     }
   }
 
@@ -347,7 +348,6 @@ async function RemoteSocketToWS(remoteSocket, webSocket, protocolResponseHeader,
     );
   } catch (error) {
     console.error(`RemoteSocketToWS error:`, error.stack || error);
-    safeCloseWebSocket(webSocket);
   }
 
   if (!hasIncomingData && retry) {
@@ -388,18 +388,40 @@ function safeCloseWebSocket(socket) {
 }
 
 async function createDnsPipeline(webSocket, vlessResponseHeader, log) {
-  let isHeaderSent = false;
-  const transformStream = new TransformStream({
-    transform(chunk, controller) {
-      for (let index = 0; index < chunk.byteLength;) {
-        const lengthBuffer = chunk.slice(index, index + 2);
-        const udpPacketLength = new DataView(lengthBuffer).getUint16(0);
-        const udpData = new Uint8Array(chunk.slice(index + 2, index + 2 + udpPacketLength));
-        index = index + 2 + udpPacketLength;
-        controller.enqueue(udpData);
-      }
-    },
-  });
+  
+let isHeaderSent = false;
+let pending = new Uint8Array(0);
+
+const transformStream = new TransformStream({
+  transform(chunk, controller) {
+    const incoming =
+      chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+
+    const data = new Uint8Array(pending.length + incoming.length);
+    data.set(pending, 0);
+    data.set(incoming, pending.length);
+
+    let offset = 0;
+
+    while (data.length - offset >= 2) {
+      const udpPacketLength = (data[offset] << 8) | data[offset + 1];
+      const frameLength = udpPacketLength + 2;
+
+      if (data.length - offset < frameLength) break;
+
+      controller.enqueue(data.slice(offset + 2, offset + frameLength));
+      offset += frameLength;
+    }
+
+    pending = data.slice(offset);
+  },
+
+  flush() {
+    if (pending.length !== 0) {
+      throw new Error("Incomplete DNS-over-WebSocket frame");
+    }
+  },
+});
 
   transformStream.readable
     .pipeTo(

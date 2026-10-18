@@ -33,7 +33,7 @@ on:
       proxyip:
         description: "Optional: Enter a specific Proxy IP/host for this run"
         required: false
-        default: di.nscl.ir
+        default: ""
       uuid:
         description: "Optional: Enter a specific UUID for this run (leave blank to generate a random one)"
         required: false
@@ -235,6 +235,7 @@ jobs:
         with:
           apiToken: ${{ matrix.index == 1 && secrets.CLOUDFLARE_API_TOKEN || secrets[format('CLOUDFLARE_API_TOKEN_{0}', matrix.index)] }}
           accountId: ${{ matrix.index == 1 && secrets.CLOUDFLARE_ACCOUNT_ID || secrets[format('CLOUDFLARE_ACCOUNT_ID_{0}', matrix.index)] }}
+          wranglerVersion: "4.86.0"
           command: deploy --name ${{ steps.worker.outputs.name }}
           vars: |
             UUID

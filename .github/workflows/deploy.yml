@@ -1,9 +1,9 @@
 name: ☁️ Deploy Worker
 
 on:
-  push:
-    branches:
-      - main
+#  push:
+#    branches:
+#      - main
   workflow_dispatch:
     inputs:
       account_1:
@@ -242,6 +242,14 @@ jobs:
 
           WASM_FILE=$(find ./dist-check -maxdepth 1 -type f -name '*-zr_wasm_bg.wasm' -print -quit)
           WASM_NAME=$(basename "$WASM_FILE")
+          PANEL_FILE=$(find ./dist-check -maxdepth 1 -type f -name '*-panel.b64' -print -quit)
+
+          if [ -z "$PANEL_FILE" ] || [ ! -s "$PANEL_FILE" ]; then
+            echo "::error::Bundled panel.b64 file was not found."
+            exit 1
+          fi
+          
+          PANEL_NAME=$(basename "$PANEL_FILE")
           COMPATIBILITY_DATE=$(grep -m1 '^compatibility_date' wrangler.toml | sed -E 's/.*"([^"]+)".*/\1/')
 
           jq -n \
@@ -259,17 +267,23 @@ jobs:
               ]
             }' > /tmp/worker-metadata.json
 
-          UPLOAD_RESPONSE=$(curl --silent --show-error --fail-with-body -X PUT \
+          UPLOAD_HTTP_CODE=$(curl --silent --show-error \
+            -o /tmp/worker-upload-response.json \
+            -w "%{http_code}" \
+            -X PUT \
             "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/scripts/${WORKER_NAME}" \
             -H "Authorization: Bearer ${API_TOKEN}" \
             -F "metadata=@/tmp/worker-metadata.json;type=application/json" \
             -F "index.js=@./dist-check/index.js;type=application/javascript+module" \
-            -F "${WASM_NAME}=@${WASM_FILE};type=application/wasm")
-
-          echo "$UPLOAD_RESPONSE" | jq .
-
-          if [ "$(echo "$UPLOAD_RESPONSE" | jq -r '.success // false')" != "true" ]; then
-            echo "::error::Cloudflare rejected the Worker script upload."
+            -F "${WASM_NAME}=@${WASM_FILE};type=application/wasm" \
+            -F "${PANEL_NAME}=@${PANEL_FILE};type=text/plain")
+          
+          echo "Cloudflare upload HTTP status: $UPLOAD_HTTP_CODE"
+          jq . /tmp/worker-upload-response.json || cat /tmp/worker-upload-response.json
+          
+          if [ "$UPLOAD_HTTP_CODE" -lt 200 ] || [ "$UPLOAD_HTTP_CODE" -ge 300 ] ||
+             [ "$(jq -r '.success // false' /tmp/worker-upload-response.json)" != "true" ]; then
+            echo "::error::Cloudflare Worker upload failed."
             exit 1
           fi
 

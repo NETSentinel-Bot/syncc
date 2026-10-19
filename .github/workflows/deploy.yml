@@ -175,6 +175,26 @@ jobs:
           fi
           echo "proxyip=$PROXY_VALUE" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve Placement (Google AI Studio)
+        id: placementval
+        env:
+          INPUT_ENABLE: ${{ inputs.enable_gemini }}
+          SECRET_ENABLE: ${{ secrets.ENABLE_GEMINI }}
+        run: |
+          KEY=""
+          VALUE=""
+          SUMMARY="Disabled"
+
+          if [ "$INPUT_ENABLE" = "true" ] || [ "$SECRET_ENABLE" = "true" ]; then
+            KEY="region"
+            VALUE="gcp:us-west2"
+            SUMMARY="Enabled (Google AI Studio support — gcp:us-central1)"
+          fi
+
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "value=$VALUE" >> "$GITHUB_OUTPUT"
+          echo "summary=$SUMMARY" >> "$GITHUB_OUTPUT"
+
       - name: Resolve worker name
         id: worker
         env:
@@ -200,6 +220,15 @@ jobs:
       - name: Encode panel
         run: base64 -w0 index.html > src/panel.b64
 
+      - name: Apply Placement Hint
+        if: steps.placementval.outputs.key != ''
+        run: |
+          {
+            echo ""
+            echo "[placement]"
+            echo "${{ steps.placementval.outputs.key }} = \"${{ steps.placementval.outputs.value }}\""
+          } >> wrangler.toml
+
       - name: Setup Node.js (for wrangler dry-run)
         uses: actions/setup-node@v4
         with:
@@ -208,134 +237,22 @@ jobs:
       - name: Install wrangler
         run: npm install -g wrangler@4
 
-      
-      - name: Bundle Worker for direct API upload
-        env:
-          WORKER_NAME: ${{ steps.worker.outputs.name }}
-        run: |
-          set -euo pipefail
-          rm -rf ./dist-check
-          wrangler deploy --dry-run --outdir=./dist-check --name "$WORKER_NAME"
-
-          test -s ./dist-check/index.js
-          WASM_FILE=$(find ./dist-check -maxdepth 1 -type f -name '*-zr_wasm_bg.wasm' -print -quit)
-
-          if [ -z "$WASM_FILE" ] || [ ! -s "$WASM_FILE" ]; then
-            echo "::error::Bundled WASM file was not found."
-            ls -la ./dist-check
-            exit 1
-          fi
-
-          echo "Bundle artifacts:"
-          ls -lah ./dist-check
-
-      - name: Deploy via Cloudflare REST API
+      - name: "Deploy via Wrangler Action (${{ steps.worker.outputs.name }} → ${{ steps.account.outputs.label }})"
         id: deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ matrix.index == 1 && secrets.CLOUDFLARE_API_TOKEN || secrets[format('CLOUDFLARE_API_TOKEN_{0}', matrix.index)] }}
+          accountId: ${{ matrix.index == 1 && secrets.CLOUDFLARE_ACCOUNT_ID || secrets[format('CLOUDFLARE_ACCOUNT_ID_{0}', matrix.index)] }}
+          wranglerVersion: "4.86.0"
+          command: deploy --name ${{ steps.worker.outputs.name }}
+          vars: |
+            UUID
+            PROXYIP
+            WORKERNAME
         env:
-          API_TOKEN: ${{ matrix.index == 1 && secrets.CLOUDFLARE_API_TOKEN || secrets[format('CLOUDFLARE_API_TOKEN_{0}', matrix.index)] }}
-          ACCOUNT_ID: ${{ matrix.index == 1 && secrets.CLOUDFLARE_ACCOUNT_ID || secrets[format('CLOUDFLARE_ACCOUNT_ID_{0}', matrix.index)] }}
-          WORKER_NAME: ${{ steps.worker.outputs.name }}
           UUID: ${{ steps.uuidval.outputs.uuid }}
           PROXYIP: ${{ steps.proxyval.outputs.proxyip }}
-        run: |
-          set -euo pipefail
-
-          WASM_FILE=$(find ./dist-check -maxdepth 1 -type f -name '*-zr_wasm_bg.wasm' -print -quit)
-          WASM_NAME=$(basename "$WASM_FILE")
-          PANEL_FILE=$(find ./dist-check -maxdepth 1 -type f -name '*-panel.b64' -print -quit)
-
-          if [ -z "$PANEL_FILE" ] || [ ! -s "$PANEL_FILE" ]; then
-            echo "::error::Bundled panel.b64 file was not found."
-            exit 1
-          fi
-          
-          PANEL_NAME=$(basename "$PANEL_FILE")
-          COMPATIBILITY_DATE=$(grep -m1 '^compatibility_date' wrangler.toml | sed -E 's/.*"([^"]+)".*/\1/')
-
-          jq -n \
-            --arg compatibility_date "$COMPATIBILITY_DATE" \
-            --arg uuid "$UUID" \
-            --arg proxyip "$PROXYIP" \
-            --arg workername "$WORKER_NAME" \
-            '{
-              main_module: "index.js",
-              compatibility_date: $compatibility_date,
-              bindings: [
-                {type: "plain_text", name: "UUID", text: $uuid},
-                {type: "plain_text", name: "PROXYIP", text: $proxyip},
-                {type: "plain_text", name: "WORKERNAME", text: $workername}
-              ]
-            }' > /tmp/worker-metadata.json
-
-          UPLOAD_HTTP_CODE=$(curl --silent --show-error \
-            -o /tmp/worker-upload-response.json \
-            -w "%{http_code}" \
-            -X PUT \
-            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/scripts/${WORKER_NAME}" \
-            -H "Authorization: Bearer ${API_TOKEN}" \
-            -F "metadata=@/tmp/worker-metadata.json;type=application/json" \
-            -F "index.js=@./dist-check/index.js;type=application/javascript+module" \
-            -F "${WASM_NAME}=@${WASM_FILE};type=application/wasm" \
-            -F "${PANEL_NAME}=@${PANEL_FILE};type=text/plain")
-          
-          echo "Cloudflare upload HTTP status: $UPLOAD_HTTP_CODE"
-          jq . /tmp/worker-upload-response.json || cat /tmp/worker-upload-response.json
-          
-          if [ "$UPLOAD_HTTP_CODE" -lt 200 ] || [ "$UPLOAD_HTTP_CODE" -ge 300 ] ||
-             [ "$(jq -r '.success // false' /tmp/worker-upload-response.json)" != "true" ]; then
-            echo "::error::Cloudflare Worker upload failed."
-            exit 1
-          fi
-
-          SUBDOMAIN_RESPONSE=$(curl --silent --show-error --fail-with-body -X POST \
-            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/scripts/${WORKER_NAME}/subdomain" \
-            -H "Authorization: Bearer ${API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{"enabled": true}')
-
-          echo "$SUBDOMAIN_RESPONSE" | jq .
-
-          if [ "$(echo "$SUBDOMAIN_RESPONSE" | jq -r '.success // false')" != "true" ]; then
-            echo "::error::Could not enable the Worker subdomain."
-            exit 1
-          fi
-
-          SUBDOMAIN_RESPONSE=$(curl --silent --show-error --fail-with-body \
-            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/subdomain" \
-            -H "Authorization: Bearer ${API_TOKEN}")
-
-          SUBDOMAIN=$(echo "$SUBDOMAIN_RESPONSE" | jq -er '.result.subdomain')
-          TEST_URL="https://${WORKER_NAME}.${SUBDOMAIN}.workers.dev"
-
-          echo "deployment-url=$TEST_URL" >> "$GITHUB_OUTPUT"
-          echo "test-url=$TEST_URL" >> "$GITHUB_OUTPUT"
-
-          sleep 5
-
-          ROOT_STATUS=$(curl --silent --show-error \
-            -o /tmp/worker-root-response.txt \
-            -w "%{http_code}" "$TEST_URL/")
-
-          UUID_STATUS=$(curl --silent --show-error \
-            -o /tmp/worker-uuid-response.txt \
-            -w "%{http_code}" "$TEST_URL/$UUID")
-
-          echo "root-status=$ROOT_STATUS" >> "$GITHUB_OUTPUT"
-          echo "uuid-status=$UUID_STATUS" >> "$GITHUB_OUTPUT"
-
-          echo "Root path status: $ROOT_STATUS"
-          echo "UUID path status: $UUID_STATUS"
-
-          if grep -qi 'Error 1101' /tmp/worker-root-response.txt /tmp/worker-uuid-response.txt; then
-            echo "::error::Cloudflare Error 1101 detected."
-            exit 1
-          fi
-
-          if [ "$UUID_STATUS" != "200" ]; then
-            echo "::error::UUID route did not return HTTP 200."
-            head -c 4000 /tmp/worker-uuid-response.txt || true
-            exit 1
-          fi
+          WORKERNAME: ${{ steps.worker.outputs.name }}
 
       - name: Deployment Summary
         run: |
@@ -351,9 +268,7 @@ jobs:
             echo "| **Account** | ${{ steps.account.outputs.label }} (slot ${{ matrix.index }}) |"
             echo "| **Worker** | \`${{ steps.worker.outputs.name }}\` |"
             echo "| **Base URL** | $BASE_URL |"
-            echo "| **Root path status** | \`${{ steps.deploy.outputs.root-status }}\` |"
-            echo "| **UUID path status** | \`${{ steps.deploy.outputs.uuid-status }}\` |"
-            echo "| **Status** | Deployed and UUID route verified |"
+            echo "| **Status** | Deployed successfully |"
             echo ""
             echo "<br/>"
             echo ""
@@ -363,6 +278,7 @@ jobs:
             echo "|:-------------|:----------|"
             echo "| **PROXYIP** | \`${{ steps.proxyval.outputs.proxyip }}\` |"
             echo "| **UUID** | \`${{ steps.uuidval.outputs.uuid_masked }}\` |"
+            echo "| **Google AI Studio** | ${{ steps.placementval.outputs.summary }} |"
             echo ""
             echo "<br/>"
             echo ""

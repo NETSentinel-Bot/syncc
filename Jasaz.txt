@@ -1,0 +1,1389 @@
+Directory structure:
+└── itsyebekhe-jasaz/
+    ├── functions/
+    │   ├── _core.js
+    │   └── api/
+    │       ├── analyze.js
+    │       ├── deploy.js
+    │       ├── raw.js
+    │       ├── sub.js
+    │       └── telegram-bot.js
+    └── .github/
+        └── workflows/
+            └── deploy.yml
+
+================================================
+FILE: functions/_core.js
+================================================
+// functions/_core.js
+const XOR_KEY = 0x4f;
+
+function encodeStringToTable(str, key) {
+  const utf8Str = unescape(encodeURIComponent(str));
+  let out = "";
+  for (let i = 0; i < utf8Str.length; i++) {
+    out += String.fromCharCode(utf8Str.charCodeAt(i) ^ (key ^ (i % 11)));
+  }
+  return btoa(out);
+}
+
+export function obfuscateWorkerCode(code) {
+  const stringTable = [];
+  const stringIndexMap = new Map();
+
+  function getOrAddString(strContent) {
+    if (stringIndexMap.has(strContent)) return stringIndexMap.get(strContent);
+    const idx = stringTable.length;
+    stringTable.push(encodeStringToTable(strContent, XOR_KEY));
+    stringIndexMap.set(strContent, idx);
+    return idx;
+  }
+
+  let i = 0;
+  const len = code.length;
+  let output = "";
+
+  while (i < len) {
+    const char = code[i];
+    const nextChar = i + 1 < len ? code[i + 1] : "";
+
+    if (char === "/" && nextChar === "/") {
+      const end = code.indexOf("\n", i);
+      if (end === -1) { output += code.slice(i); break; }
+      output += code.slice(i, end);
+      i = end;
+      continue;
+    }
+
+    if (char === "/" && nextChar === "*") {
+      const end = code.indexOf("*/", i + 2);
+      if (end === -1) { output += code.slice(i); break; }
+      output += code.slice(i, end + 2);
+      i = end + 2;
+      continue;
+    }
+
+    if (char === "`") {
+      let end = i + 1;
+      while (end < len) {
+        if (code[end] === "\\") end += 2;
+        else if (code[end] === "`") { end++; break; }
+        else end++;
+      }
+      output += code.slice(i, end);
+      i = end;
+      continue;
+    }
+
+    if (char === "/") {
+      const trimmed = output.trimEnd();
+      const lastChar = trimmed.slice(-1);
+      const isRegex = !lastChar || "(=:[,!&|?;{}~^+*%-".includes(lastChar) || /(?:return|case|delete|throw|typeof)\s*$/.test(trimmed);
+
+      if (isRegex) {
+        let end = i + 1;
+        let inClass = false;
+        while (end < len) {
+          if (code[end] === "\\") end += 2;
+          else if (code[end] === "[" && !inClass) { inClass = true; end++; }
+          else if (code[end] === "]" && inClass) { inClass = false; end++; }
+          else if (code[end] === "/" && !inClass) {
+            end++;
+            while (end < len && /[gimsuy]/.test(code[end])) end++;
+            break;
+          } else end++;
+        }
+        output += code.slice(i, end);
+        i = end;
+        continue;
+      }
+    }
+
+    if (char === '"' || char === "'") {
+      const quote = char;
+      const strStart = i;
+      let strEnd = i + 1;
+
+      while (strEnd < len) {
+        if (code[strEnd] === "\\") strEnd += 2;
+        else if (code[strEnd] === quote) { strEnd++; break; }
+        else if (code[strEnd] === "\n") break;
+        else strEnd++;
+      }
+
+      const strLiteral = code.slice(strStart, strEnd);
+      let rawVal = null;
+      try {
+        rawVal = quote === '"'
+          ? JSON.parse(strLiteral)
+          : JSON.parse(`"${strLiteral.slice(1, -1).replace(/\\'/g, "'").replace(/"/g, '\\"')}"`);
+      } catch {
+        rawVal = strLiteral.slice(1, -1);
+      }
+
+      const prevTrimmed = output.trimEnd();
+      const isImportExport = /(?:from|import)\s*$/.test(prevTrimmed);
+      const isDirective = rawVal === "use strict";
+
+      if (isImportExport || isDirective || !rawVal || rawVal.length === 0) {
+        output += strLiteral;
+        i = strEnd;
+        continue;
+      }
+
+      let k = strEnd;
+      while (k < len && (code[k] === " " || code[k] === "\t" || code[k] === "\r" || code[k] === "\n")) k++;
+      const isFollowedByColon = (code[k] === ":" && code[k + 1] !== ":");
+      const lastToken = prevTrimmed.slice(-1);
+      const isTernaryOrCondition = lastToken === "?" || /(?:case)\s*$/.test(prevTrimmed);
+
+      if (isFollowedByColon && !isTernaryOrCondition) {
+        output += strLiteral;
+      } else {
+        const idx = getOrAddString(rawVal);
+        output += `func_dec(${idx})`;
+      }
+
+      i = strEnd;
+      continue;
+    }
+
+    output += char;
+    i++;
+  }
+
+  const runtimeHeader = `// @ts-nocheck
+const _0x_key = ${XOR_KEY};
+const _0x_tbl = ${JSON.stringify(stringTable)};
+const _0x_cache = new Map();
+function func_dec(idx) {
+  if (_0x_cache.has(idx)) return _0x_cache.get(idx);
+  const raw = atob(_0x_tbl[idx]);
+  let out = "";
+  for (let i = 0; i < raw.length; i++) {
+    out += String.fromCharCode(raw.charCodeAt(i) ^ (_0x_key ^ (i % 11)));
+  }
+  try {
+    out = decodeURIComponent(escape(out));
+  } catch (_) {}
+  _0x_cache.set(idx, out);
+  return out;
+}
+`;
+  return runtimeHeader + "\n" + output;
+}
+
+export async function deployWorker({ accountId, apiToken, workerName, scriptUrl, d1Name, bindingName, kvName, kvBindingName, enableObfuscation, recreateWorker }) {
+  if (!accountId || !apiToken || !workerName || !scriptUrl) {
+    throw new Error("فیلدهای اجباری (Account ID، Token، نام ورکر و آدرس سورس) ناقص هستند.");
+  }
+
+  const cfHeaders = { Authorization: `Bearer ${apiToken}` };
+
+  const scriptRes = await fetch(scriptUrl, {
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PagesDeployer/1.0" },
+  });
+  if (!scriptRes.ok) {
+    throw new Error(`خطا در دانلود سورس: ${scriptRes.status} ${scriptRes.statusText}`);
+  }
+  let workerScript = await scriptRes.text();
+
+  if (enableObfuscation) {
+    workerScript = obfuscateWorkerCode(workerScript);
+  }
+
+  const bindings = [];
+  let d1DatabaseId = null;
+  let kvNamespaceId = null;
+
+  if (d1Name && bindingName) {
+    const listRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database`, {
+      headers: cfHeaders,
+    });
+    const listData = await listRes.json();
+
+    if (!listData.success) {
+      const isAuthErr = listData.errors?.some(e => e.code === 10000);
+      if (isAuthErr) {
+        throw new Error("خطای دسترسی کلودفلر (کد ۱۰۰۰۰): توکن دسترسی 'D1: Edit' را ندارد یا Account ID اشتباه است.");
+      }
+      throw new Error(`خطای دیتابیس D1: ${JSON.stringify(listData.errors)}`);
+    }
+
+    const existingDb = listData.result?.find((db) => db.name === d1Name);
+
+    if (existingDb) {
+      d1DatabaseId = existingDb.uuid;
+    } else {
+      const d1Res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database`, {
+        method: "POST",
+        headers: { ...cfHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ name: d1Name }),
+      });
+      const d1Data = await d1Res.json();
+      if (!d1Data.success) {
+        throw new Error(`خطا در ایجاد D1: ${JSON.stringify(d1Data.errors)}`);
+      }
+      d1DatabaseId = d1Data.result.uuid;
+    }
+
+    bindings.push({ type: "d1", name: bindingName, id: d1DatabaseId });
+  }
+
+  if (kvName && kvBindingName) {
+    const kvListRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces`, {
+      headers: cfHeaders,
+    });
+    const kvListData = await kvListRes.json();
+
+    if (!kvListData.success) {
+      throw new Error(`خطا در دسترسی KV: ${JSON.stringify(kvListData.errors)}`);
+    }
+
+    const existingKv = kvListData.result?.find((ns) => ns.title === kvName);
+
+    if (existingKv) {
+      kvNamespaceId = existingKv.id;
+    } else {
+      const createKvRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces`, {
+        method: "POST",
+        headers: { ...cfHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ title: kvName }),
+      });
+      const createKvData = await createKvRes.json();
+      if (!createKvData.success) {
+        throw new Error(`خطا در ایجاد KV Namespace: ${JSON.stringify(createKvData.errors)}`);
+      }
+      kvNamespaceId = createKvData.result.id;
+    }
+
+    bindings.push({ type: "kv_namespace", name: kvBindingName, namespace_id: kvNamespaceId });
+  }
+
+  if (recreateWorker) {
+    try {
+      await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${workerName}`, {
+        method: "DELETE",
+        headers: cfHeaders,
+      });
+    } catch (_) {}
+  }
+
+  const isModule = workerScript.includes("export default") || workerScript.includes("export ");
+  const formData = new FormData();
+  const metadata = {
+    ...(isModule ? { main_module: "worker.js" } : { body_part: "worker.js" }),
+    bindings: bindings,
+    compatibility_date: new Date().toISOString().split("T")[0],
+  };
+
+  formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+  formData.append("worker.js", new Blob([workerScript], { type: "application/javascript+module" }), "worker.js");
+
+  const uploadRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${workerName}`, {
+    method: "PUT",
+    headers: cfHeaders,
+    body: formData,
+  });
+
+  const uploadData = await uploadRes.json();
+  if (!uploadData.success) {
+    throw new Error(`خطا از سوی کلودفلر: ${JSON.stringify(uploadData.errors)}`);
+  }
+  
+  await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${workerName}/subdomain`, {
+    method: "POST",
+    headers: { ...cfHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: true }),
+  });
+
+  let workerUrl = null;
+  try {
+    const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
+      headers: cfHeaders,
+    });
+    const subData = await subRes.json();
+    if (subData.success && subData.result?.subdomain) {
+      workerUrl = `https://${workerName}.${subData.result.subdomain}.workers.dev`;
+    }
+  } catch (_) {}
+
+  return {
+    success: true,
+    workerName,
+    workerUrl,
+    d1DatabaseId,
+    kvNamespaceId,
+    obfuscated: !!enableObfuscation,
+    recreated: !!recreateWorker,
+  };
+}
+
+
+================================================
+FILE: functions/api/analyze.js
+================================================
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
+export async function onRequestOptions() {
+  return new Response(null, { status: 204, headers: corsHeaders });
+}
+
+export async function onRequestPost({ request }) {
+  try {
+    const { scriptUrl, geminiApiKey } = await request.json();
+
+    if (!scriptUrl || !geminiApiKey) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: "لطفاً هم آدرس سورس کد ورکر و هم کلید Gemini API را وارد کنید." 
+      }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" },
+      });
+    }
+
+    const scriptRes = await fetch(scriptUrl, {
+      headers: { "User-Agent": "Mozilla/5.0 Jasaz-AI-Analyzer/1.0" }
+    });
+    if (!scriptRes.ok) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: `خطا در دریافت فایل سورس ورکر: ${scriptRes.status} ${scriptRes.statusText}` 
+      }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" },
+      });
+    }
+    const workerCode = await scriptRes.text();
+
+    const maxChars = 80000;
+    const truncatedCode = workerCode.length > maxChars 
+      ? workerCode.slice(0, maxChars) + "\n// ... [کد کوتاه شده است]"
+      : workerCode;
+
+    const prompt = `You are a cybersecurity and reverse-engineering specialist analyzing a Cloudflare Worker script.
+Analyze the following JavaScript code and extract ALL string literals, variables, paths, and configurations related in any way to proxying, VPNs, circumvention tools, and protocols such as:
+- V2Ray / Xray (VLESS, VMess, Trojan, Shadowsocks, Hysteria, TUIC, SOCKS5, HTTP)
+- Sing-box / Clash / Mihomo / Box formats
+- UUIDs, passwords, secrets, tokens, auth headers
+- Proxy IPs, Clean IPs, DNS over HTTPS (DoH), ECH configs, SNIs, host headers, WS/gRPC/xHTTP paths
+- Routing tags, outbound names, cipher suites, fragment settings
+- Hardcoded endpoints, subscription links, admin paths, dashboard routes
+
+Return ONLY valid JSON (without Markdown codeblocks, without backticks, without preamble) in this exact schema:
+{
+  "summary": "Short explanation of what this worker does",
+  "protocols": ["List of detected protocols like vless, trojan, etc."],
+  "admin_and_sub_paths": ["List of extracted URL paths, e.g. /panel, /sub, /sync/dash, etc."],
+  "keys_and_passwords": ["List of UUIDs, default passwords, secrets, auth tokens found"],
+  "hosts_and_clean_ips": ["List of server hosts, sni, cdn domains, fallback proxies, DNS IPs"],
+  "transport_and_network": ["List of paths, ws settings, grpc service names, fragment headers, cipher suites"],
+  "all_proxy_related_strings": ["Complete flat array of any other unique string that has even a slight relation to proxy/network configuration"]
+}
+
+Source Code:
+${truncatedCode}`;
+
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${geminiApiKey.trim()}`;
+    
+    const geminiRes = await fetch(geminiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{
+          parts: [{ text: prompt }]
+        }],
+        generationConfig: {
+          temperature: 0.1,
+          responseMimeType: "application/json"
+        }
+      })
+    });
+
+    const geminiData = await geminiRes.json();
+    if (!geminiRes.ok) {
+      const errMsg = geminiData.error?.message || JSON.stringify(geminiData);
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: `خطا از سوی Gemini API: ${errMsg}` 
+      }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" },
+      });
+    }
+
+    const rawReply = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!rawReply) {
+      throw new Error("پاسخی از مدل هوش مصنوعی دریافت نشد.");
+    }
+
+    let parsedResult;
+    try {
+      parsedResult = JSON.parse(rawReply.replace(/^```json/i, '').replace(/```$/i, '').trim());
+    } catch {
+      parsedResult = { raw: rawReply };
+    }
+
+    return new Response(JSON.stringify({
+      success: true,
+      analysis: parsedResult,
+      codeSize: workerCode.length
+    }), {
+      status: 200,
+      headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" },
+    });
+
+  } catch (err) {
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: `خطای سرور: ${err.message}` 
+    }), {
+      status: 500,
+      headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" },
+    });
+  }
+}
+
+
+================================================
+FILE: functions/api/deploy.js
+================================================
+// functions/api/deploy.js
+import { deployWorker } from "../_core.js";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
+export async function onRequestOptions() {
+  return new Response(null, { status: 204, headers: corsHeaders });
+}
+
+export async function onRequestPost({ request }) {
+  try {
+    const payload = await request.json();
+    const result = await deployWorker(payload);
+    return new Response(JSON.stringify(result), {
+      status: 200,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    return new Response(JSON.stringify({ success: false, error: err.message }), {
+      status: 400,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+}
+
+
+================================================
+FILE: functions/api/raw.js
+================================================
+export async function onRequestGet({ request }) {
+  const url = new URL(request.url).searchParams.get("url");
+  if (!url) {
+    return new Response("Missing url", { status: 400 });
+  }
+
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PagesDeployer/1.0" },
+    });
+    const text = await res.text();
+    return new Response(text, {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  } catch (err) {
+    return new Response(err.message, { status: 500, headers: { "Access-Control-Allow-Origin": "*" } });
+  }
+}
+
+
+================================================
+FILE: functions/api/sub.js
+================================================
+const DEFAULT_FM = '{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["0","104","1"],"delays":["0"],"maxSplit":"0"}},{"type":"fragment","settings":{"packets":"1-1","lengths":["114","1"],"delays":["1"],"maxSplit":"11"}}]}';
+const DEFAULT_CS = 'TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256:TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256';
+
+const DEFAULT_ECH_LIST = [
+  "cloudflare-ech.com+udp://1.1.1.1",
+  "cloudflare-ech.com+udp://8.8.8.8"
+];
+
+const ORDER_KEYS = ['cs', 'path', 'security', 'alpn', 'encryption', 'fm', 'insecure', 'host', 'fp', 'ech', 'type', 'allowInsecure', 'sni'];
+
+function b64decode(str) {
+  try {
+    const clean = str.trim().replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
+    return decodeURIComponent(escape(atob(clean)));
+  } catch (_) {
+    try {
+      return atob(str.trim());
+    } catch {
+      return '';
+    }
+  }
+}
+
+function b64encode(str) {
+  return btoa(unescape(encodeURIComponent(str)));
+}
+
+function parseQuery(q) {
+  const out = [];
+  if (!q) return out;
+  q.split('&').forEach((p) => {
+    if (!p) return;
+    const i = p.indexOf('=');
+    const k = i < 0 ? p : p.slice(0, i);
+    const v = i < 0 ? '' : p.slice(i + 1);
+    try {
+      out.push({ k: decodeURIComponent(k), v: decodeURIComponent(v) });
+    } catch {
+      out.push({ k, v });
+    }
+  });
+  return out;
+}
+
+function setParam(params, key, val) {
+  const lk = key.toLowerCase();
+  let found = false;
+  for (let i = params.length - 1; i >= 0; i--) {
+    if (params[i].k.toLowerCase() === lk) {
+      if (found) { params.splice(i, 1); continue; }
+      params[i] = { k: key, v: val };
+      found = true;
+    }
+  }
+  if (!found) params.push({ k: key, v: val });
+}
+
+function buildQS(params) {
+  const idx = {};
+  ORDER_KEYS.forEach((k, i) => { idx[k] = i; });
+  const a = [], b = [];
+  params.forEach((x) => {
+    if (idx[x.k.toLowerCase()] !== undefined) a.push(x);
+    else b.push(x);
+  });
+  a.sort((x, y) => idx[x.k.toLowerCase()] - idx[y.k.toLowerCase()]);
+  return a.concat(b).map((x) => `${encodeURIComponent(x.k)}=${encodeURIComponent(x.v)}`).join('&');
+}
+
+function splitUrl(raw, skip) {
+  let b = raw.slice(skip), frag = '';
+  const qi = b.indexOf('?');
+  const hi = b.indexOf('#', qi >= 0 ? qi : 0);
+  if (hi >= 0) {
+    frag = b.slice(hi + 1);
+    b = b.slice(0, hi);
+  }
+  let q = '';
+  const x = b.indexOf('?');
+  if (x >= 0) {
+    q = b.slice(x + 1);
+    b = b.slice(0, x);
+  }
+  return { body: b, q, frag };
+}
+
+function parseVless(raw) {
+  const s = splitUrl(raw, 8);
+  const a = s.body.lastIndexOf('@');
+  if (a < 0) return null;
+  const id = s.body.slice(0, a).trim();
+  const hostPort = s.body.slice(a + 1).trim();
+  return { proto: 'vless', id, hostPort, p: parseQuery(s.q), f: s.frag };
+}
+
+function parseTrojan(raw) {
+  const s = splitUrl(raw, 9);
+  const a = s.body.lastIndexOf('@');
+  if (a < 0) return null;
+  const pass = s.body.slice(0, a).trim();
+  const hostPort = s.body.slice(a + 1).trim();
+  return { proto: 'trojan', pass, hostPort, p: parseQuery(s.q), f: s.frag };
+}
+
+function extractIpFromEch(ech) {
+  const m = String(ech || '').match(/udp:\/\/([^+\s]+)/i);
+  return m ? m[1].replace(/^\[|\]$/g, '') : ech;
+}
+
+function extractDomainFromEch(ech) {
+  const s = String(ech || '');
+  const i = s.indexOf('+');
+  return i >= 0 ? s.slice(0, i) : s;
+}
+
+function processConfig(raw, opts) {
+  let item = null;
+  const trimmed = raw.trim();
+  if (/^vless:\/\//i.test(trimmed)) item = parseVless(trimmed);
+  else if (/^trojan:\/\//i.test(trimmed)) item = parseTrojan(trimmed);
+  if (!item) return [];
+
+  const out = [];
+  const baseName = item.f ? decodeURIComponent(item.f) : item.proto;
+
+  if (opts.enableEch) {
+    opts.echList.forEach((echVal) => {
+      const clone = JSON.parse(JSON.stringify(item));
+      applyAdvancedParams(clone, opts);
+
+      setParam(clone.p, 'ech', echVal);
+
+      const ip = extractIpFromEch(echVal);
+      const domain = extractDomainFromEch(echVal);
+      const remark = opts.suffix
+        ? opts.suffix.replace(/\{name\}/g, baseName).replace(/\{ip\}/g, ip).replace(/\{domain\}/g, domain).replace(/\{type\}/g, item.proto)
+        : `${baseName} ECH ${ip}`;
+
+      const qs = buildQS(clone.p);
+      const auth = clone.proto === 'vless' ? clone.id : encodeURIComponent(clone.pass);
+      out.push(`${clone.proto}://${auth}@${clone.hostPort}${qs ? `?${qs}` : ''}#${encodeURIComponent(remark)}`);
+    });
+  } else {
+
+    applyAdvancedParams(item, opts);
+    const qs = buildQS(item.p);
+    const auth = item.proto === 'vless' ? item.id : encodeURIComponent(item.pass);
+    out.push(`${item.proto}://${auth}@${item.hostPort}${qs ? `?${qs}` : ''}#${item.f || ''}`);
+  }
+
+  return out;
+}
+
+function applyAdvancedParams(item, opts) {
+  if (opts.customHost) {
+    const parts = item.hostPort.split(':');
+    const port = parts.length > 1 ? `:${parts[parts.length - 1]}` : '';
+    item.hostPort = `${opts.customHost}${port}`;
+  }
+  if (opts.fp) {
+    setParam(item.p, 'fp', opts.fp);
+  }
+  if (opts.enableFragment) {
+    setParam(item.p, 'cs', opts.cs || DEFAULT_CS);
+    setParam(item.p, 'fm', opts.fm || DEFAULT_FM);
+  }
+}
+
+export async function onRequestGet({ request }) {
+  const url = new URL(request.url);
+  const subUrl = url.searchParams.get('url') || url.searchParams.get('sub');
+  const customHost = url.searchParams.get('host') || url.searchParams.get('addr') || '';
+  const fp = url.searchParams.get('fp') || '';
+  const enableFragment = url.searchParams.get('fragment') !== '0';
+  const enableEch = url.searchParams.get('ech') === '1';
+  const customEchList = url.searchParams.get('ech_list');
+  const format = (url.searchParams.get('format') || 'b64').toLowerCase();
+  const suffix = url.searchParams.get('suffix') || ' ECH {ip}';
+
+  if (!subUrl) {
+    return new Response(JSON.stringify({
+      error: "لطفاً لینک ساب‌اسکریپشن را مشخص کنید.",
+      usage: `${url.origin}/api/sub?url=https://sub.example.com/...`,
+      parameters: {
+        host: "آدرس یا IP کلین سرور",
+        fp: "فینگرپرینت (chrome, firefox, safari, etc.)",
+        fragment: "1 یا 0 (فعال/غیرفعال کردن Fragment و Cipher Suites)",
+        ech: "1 یا 0 (فعال/غیرفعال کردن ECH)",
+        format: "b64 یا raw (نوع خروجی)"
+      }
+    }, null, 2), {
+      status: 400,
+      headers: { "Content-Type": "application/json; charset=utf-8" }
+    });
+  }
+
+  const echList = customEchList
+    ? customEchList.split(',').map((x) => x.trim()).filter(Boolean)
+    : DEFAULT_ECH_LIST;
+
+  const opts = {
+    customHost,
+    fp,
+    enableFragment,
+    enableEch,
+    echList,
+    suffix,
+    cs: url.searchParams.get('cs') || DEFAULT_CS,
+    fm: url.searchParams.get('fm') || DEFAULT_FM
+  };
+
+  try {
+    let rawText = "";
+    if (/^https?:\/\//i.test(subUrl)) {
+      const res = await fetch(subUrl, {
+        headers: { "User-Agent": "v2rayNG/1.8.12 Jasaz-Optimizer/1.0" }
+      });
+      if (!res.ok) {
+        return new Response(`خطا در دریافت ساب‌لینک: ${res.status}`, { status: 400 });
+      }
+      rawText = await res.text();
+    } else {
+      rawText = subUrl;
+    }
+
+    const decoded = b64decode(rawText);
+    const content = (decoded && (decoded.includes("vless://") || decoded.includes("trojan://"))) ? decoded : rawText;
+
+    const lines = content.split(/[\r\n]+/).map((l) => l.trim()).filter(Boolean);
+    const finalConfigs = [];
+
+    lines.forEach((line) => {
+      const generated = processConfig(line, opts);
+      finalConfigs.push(...generated);
+    });
+
+    if (finalConfigs.length === 0) {
+      return new Response("هیچ کانفیگ معتبر Vless یا Trojan یافت نشد.", { status: 404 });
+    }
+
+    const outputText = finalConfigs.join('\n');
+
+    if (format === 'raw' || format === 'txt') {
+      return new Response(outputText, {
+        headers: { "Content-Type": "text/plain; charset=utf-8" }
+      });
+    }
+
+    return new Response(b64encode(outputText), {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Subscription-Userinfo": "upload=0; download=0; total=107374182400; expire=0"
+      }
+    });
+
+  } catch (err) {
+    return new Response(`خطا در فرایند بهینه‌سازی: ${err.message}`, { status: 500 });
+  }
+}
+
+
+================================================
+FILE: functions/api/telegram-bot.js
+================================================
+// functions/api/telegram-bot.js
+import { deployWorker } from "../_core.js";
+
+const TOKEN_CREATE_URL = "https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Jasaz%20Deployer";
+
+const PRESETS = {
+  nahan: {
+    title: "🛡️ نهان (Nahan)",
+    url: "https://raw.githubusercontent.com/itsyebekhe/nahan/refs/heads/main/_worker.encode.js",
+    binding: "IOT_DB",
+    obfuscate: 0,
+    recreate: 1,
+    d1: 1,
+  },
+  zeus: {
+    title: "⚡ زئوس (Zeus)",
+    url: "https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/refs/heads/main/Source.js",
+    binding: "DB",
+    obfuscate: 1,
+    recreate: 1,
+    d1: 1,
+  },
+  custom: {
+    title: "🛠️ سفارشی (Custom)",
+    url: "",
+    binding: "DB",
+    obfuscate: 1,
+    recreate: 0,
+    d1: 0,
+  },
+};
+
+function generateRandomName(prefix = "worker") {
+  const words = ["fast", "turbo", "sky", "pixel", "smart", "flow", "shield", "edge"];
+  const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+  const num = Math.floor(Math.random() * 899) + 100;
+  return `${prefix}-${pick(words)}-${num}`;
+}
+
+async function tgApi(token, method, payload) {
+  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return await res.json();
+}
+
+function encodeAction(act, pKey, obf, clean, d1, kv = 0) {
+  return `${act}|${pKey}|${obf}|${clean}|${d1}|${kv}`;
+}
+
+function parseAction(data) {
+  const [act, pKey, obf, clean, d1, kv] = data.split("|");
+  return {
+    act,
+    pKey: pKey && PRESETS[pKey] ? pKey : "zeus",
+    obfuscate: obf === "1",
+    recreate: clean === "1",
+    d1: d1 === "1",
+    kv: kv === "1",
+  };
+}
+
+function parseConfigFromText(text = "") {
+  const getVal = (key) => {
+    const match = text.match(new RegExp(`${key}:\\s*([^\\n\\r<]+)`));
+    return match ? match[1].trim() : "";
+  };
+
+  return {
+    pKey: getVal("PRJ"),
+    accountId: getVal("ACC"),
+    apiToken: getVal("TOK"),
+    workerName: getVal("WRK") || generateRandomName("cf"),
+    d1Name: getVal("D1N") || generateRandomName("db"),
+    bindingName: getVal("BND"),
+    kvName: getVal("KVN") || generateRandomName("kv"),
+    kvBindingName: getVal("KVB") || "KV",
+    scriptUrl: getVal("URL"),
+  };
+}
+
+export async function onRequestPost({ request, env }) {
+  const BOT_TOKEN = env.BOT_TOKEN;
+  const SECRET = env.BOT_SECRET;
+
+  if (SECRET && request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== SECRET) {
+    return new Response("Unauthorized", { status: 403 });
+  }
+
+  try {
+    const update = await request.json();
+
+    if (update.callback_query) {
+      const cq = update.callback_query;
+      const chatId = cq.message.chat.id;
+      const messageId = cq.message.message_id;
+      const data = cq.data;
+      const msgText = cq.message.text || "";
+
+      if (data === "help_acc_id") {
+        await tgApi(BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cq.id, text: "راهنما ارسال شد." });
+        const helpMsg = `🔍 <b>نحوه پیدا کردن Account ID:</b>\n\nوارد داشبورد کلودفلر شده و به منوی <b>Workers & Pages</b> بروید. در آدرس‌بار مرورگر، مقدار ۳۲ حرفی را بردارید:\n<code>https://dash.cloudflare.com/<b>[ACCOUNT_ID]</b>/workers-and-pages</code>`;
+        await tgApi(BOT_TOKEN, "sendMessage", { chat_id: chatId, parse_mode: "HTML", text: helpMsg });
+        return new Response("OK");
+      }
+
+      if (data === "cancel") {
+        await tgApi(BOT_TOKEN, "editMessageText", {
+          chat_id: chatId,
+          message_id: messageId,
+          text: "❌ عملیات لغو شد. برای شروع /start را بزنید.",
+        });
+        return new Response("OK");
+      }
+
+      if (data.startsWith("pre:")) {
+        const pKey = data.split(":")[1];
+        const p = PRESETS[pKey];
+
+        const promptText = `شما پروژه <b>${p.title}</b> را انتخاب کردید.
+
+لطفاً اطلاعات کلودفلر را در قالب دو خط زیر ارسال کنید:
+
+<code>خط اول: Account ID
+خط دوم: API Token</code>
+${pKey === "custom" ? "<code>خط سوم: آدرس سورس مستقیم JS</code>" : ""}
+
+<i>(پیام بالا را کپی کرده و مقادیر خود را جایگزین کنید)</i>
+[#PRJ_${pKey}#]`;
+
+        await tgApi(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId,
+          text: promptText,
+          parse_mode: "HTML",
+          reply_markup: {
+            force_reply: true,
+            selective: true,
+            inline_keyboard: [
+              [{ text: "🔑 ساخت خودکار API Token", url: TOKEN_CREATE_URL }],
+              [{ text: "❓ راهنمای پیدا کردن Account ID", callback_data: "help_acc_id" }],
+            ],
+          },
+        });
+        return new Response("OK");
+      }
+
+      const parsed = parseAction(data);
+      const cfg = parseConfigFromText(msgText);
+      const activePresetKey = parsed.pKey || cfg.pKey || "nahan";
+      const p = PRESETS[activePresetKey];
+
+      if (parsed.act === "edit_wrk" || parsed.act === "edit_d1n" || parsed.act === "edit_bnd") {
+        const labels = {
+          edit_wrk: "نام ورکر (Worker Name)",
+          edit_d1n: "نام دیتابیس D1",
+          edit_bnd: "نام متغیر Binding",
+        };
+        const fieldKey = parsed.act.replace("edit_", "").toUpperCase();
+
+        const replyPayload = `لطفاً <b>${labels[parsed.act]}</b> دلخواه خود را بنویسید و بفرستید:
+
+[#TARGET_FIELD_${fieldKey}#]
+[#PANEL_MSG_ID_${messageId}#]
+[#PKEY_${activePresetKey}#]
+[#FLAGS_${parsed.obfuscate ? "1" : "0"}_${parsed.recreate ? "1" : "0"}_${parsed.d1 ? "1" : "0"}#]
+
+<pre>
+PRJ: ${activePresetKey}
+ACC: ${cfg.accountId}
+TOK: ${cfg.apiToken}
+WRK: ${cfg.workerName}
+D1N: ${cfg.d1Name}
+BND: ${cfg.bindingName || p.binding}
+URL: ${cfg.scriptUrl || p.url}
+</pre>`;
+
+        await tgApi(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId,
+          text: replyPayload,
+          parse_mode: "HTML",
+          reply_markup: { force_reply: true, selective: true },
+        });
+        return new Response("OK");
+      }
+
+      if (parsed.act === "rnd_wrk") cfg.workerName = generateRandomName("cf");
+      if (parsed.act === "rnd_d1") cfg.d1Name = generateRandomName("db");
+      if (parsed.act === "rnd_kv") cfg.kvName = generateRandomName("kv");
+
+      if (parsed.act === "tog_obf") parsed.obfuscate = !parsed.obfuscate;
+      if (parsed.act === "tog_cln") parsed.recreate = !parsed.recreate;
+      if (parsed.act === "tog_d1") parsed.d1 = !parsed.d1;
+      if (parsed.act === "tog_kv") parsed.kv = !parsed.kv;
+
+      if (parsed.act === "deploy") {
+        if (!cfg.accountId || !cfg.apiToken) {
+          await tgApi(BOT_TOKEN, "sendMessage", {
+            chat_id: chatId,
+            text: "❌ اطلاعات منقضی یا مفقود شده است. لطفاً /start را بزنید.",
+          });
+          return new Response("OK");
+        }
+
+        await tgApi(BOT_TOKEN, "editMessageText", {
+          chat_id: chatId,
+          message_id: messageId,
+          text: `⏳ <b>در حال استقرار پروژه ${p.title} روی کلودفلر...</b>\nلطفاً شکیبا باشید.`,
+          parse_mode: "HTML",
+        });
+
+        const finalUrl = activePresetKey === "custom" ? cfg.scriptUrl : p.url;
+        const finalBinding = cfg.bindingName || p.binding;
+
+        try {
+          const deployRes = await deployWorker({
+            accountId: cfg.accountId,
+            apiToken: cfg.apiToken,
+            workerName: cfg.workerName,
+            scriptUrl: finalUrl,
+            bindingName: parsed.d1 ? finalBinding : null,
+            d1Name: parsed.d1 ? cfg.d1Name : null,
+            kvName: parsed.kv ? cfg.kvName : null,
+            kvBindingName: parsed.kv ? cfg.kvBindingName : null,
+            enableObfuscation: parsed.obfuscate,
+            recreateWorker: parsed.recreate,
+          });
+
+          let panelUrl = deployRes.workerUrl;
+          let extraTips = "";
+
+          if (panelUrl) {
+            if (activePresetKey === "nahan") {
+              panelUrl = panelUrl.replace(/\/+$/, "") + "/sync/dash";
+              extraTips = "\n🔑 <b>رمز عبور پیش‌فرض ورود به پنل نهان:</b> <code>admin</code>";
+            } else if (activePresetKey === "zeus") {
+              panelUrl = panelUrl.replace(/\/+$/, "") + "/panel";
+            }
+          }
+
+          const resultMsg = `🎉 <b>پروژه ${p.title} با موفقیت مستقر شد!</b>
+
+🔹 <b>نام ورکر:</b> <code>${deployRes.workerName}</code>
+🔹 <b>مبهم‌سازی:</b> ${deployRes.obfuscated ? "فعال ✅" : "خاموش ❌"}
+🔹 <b>نصب تمیز:</b> ${deployRes.recreated ? "بله ✅" : "خیر"}
+${deployRes.d1DatabaseId ? `🔹 <b>دیتابیس D1:</b> <code>${cfg.d1Name}</code>\n🔹 <b>بایندینگ:</b> <code>${finalBinding}</code>` : "🔹 <b>دیتابیس D1:</b> غیرفعال"}
+${extraTips}
+
+🌐 <b>آدرس داشبورد پنل:</b>
+<a href="${panelUrl}">${panelUrl}</a>`;
+
+          await tgApi(BOT_TOKEN, "editMessageText", {
+            chat_id: chatId,
+            message_id: messageId,
+            parse_mode: "HTML",
+            text: resultMsg,
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "🚀 ورود مستقیم به پنل", url: panelUrl }],
+                [
+                  { text: "📡 کلین آی‌پی (@itsZetaBot)", url: "https://t.me/itsZetaBot" },
+                  { text: "🌐 آی‌پی رله (@nahanproxyipbot)", url: "https://t.me/nahanproxyipbot" },
+                ],
+                [{ text: "🔄 نصب ورکر دیگر", callback_data: "cancel" }],
+              ],
+            },
+          });
+        } catch (deployErr) {
+          await tgApi(BOT_TOKEN, "editMessageText", {
+            chat_id: chatId,
+            message_id: messageId,
+            parse_mode: "HTML",
+            text: `❌ <b>خطا در استقرار:</b>\n\n<code>${deployErr.message}</code>`,
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "🔑 ساخت توکن جدید (دسترسی D1)", url: TOKEN_CREATE_URL }],
+                [{ text: "🔄 تلاش مجدد", callback_data: data }],
+                [{ text: "❌ انصراف", callback_data: "cancel" }],
+              ],
+            },
+          });
+        }
+        return new Response("OK");
+      }
+
+      await renderReviewMenu(BOT_TOKEN, chatId, messageId, cfg, parsed, activePresetKey);
+      return new Response("OK");
+    }
+
+    if (update.message && update.message.text) {
+      const chatId = update.message.chat.id;
+      const text = update.message.text.trim();
+      const replyToMsg = update.message.reply_to_message;
+      const replyTo = replyToMsg?.text || "";
+
+      if (text === "/start" || text === "/new") {
+        const welcomeMsg = `سلام! به ربات نصب و مدیریت ورکر خوش آمدید 🚀
+
+پروژه مورد نظر خود را جهت استقرار انتخاب کنید:
+
+<b>🧰 سایر ابزارهای کاربردی پیشنهادی:</b>
+• @itsZetaBot: اسکنر زنده کلین آی‌پی کلودفلر، استخراج DNS و تبدیل تصادفی حروف SNI
+• @nahanproxyipbot: دسترسی روزانه به سریع‌ترین Proxy IPهای رله جهانی`;
+
+        await tgApi(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text: welcomeMsg,
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "⚡ زئوس (Zeus)", callback_data: "pre:zeus" },
+                { text: "🛡️ نهان (Nahan)", callback_data: "pre:nahan" },
+              ],
+              [{ text: "🛠️ سورس سفارشی (Custom)", callback_data: "pre:custom" }],
+              [
+                { text: "📡 ربات Zeta (کلین IP)", url: "https://t.me/itsZetaBot" },
+                { text: "🌐 ربات Proxy IP رله", url: "https://t.me/nahanproxyipbot" },
+              ],
+            ],
+          },
+        });
+        return new Response("OK");
+      }
+
+      if (replyTo.includes("[#TARGET_FIELD_")) {
+        const fieldMatch = replyTo.match(/\[#TARGET_FIELD_([A-Z0-9]+)#\]/);
+        const panelMsgMatch = replyTo.match(/\[#PANEL_MSG_ID_([0-9]+)#\]/);
+        const pKeyMatch = replyTo.match(/\[#PKEY_([a-z0-9]+)#\]/);
+        const flagsMatch = replyTo.match(/\[#FLAGS_([01])_([01])_([01])#\]/);
+
+        if (fieldMatch && panelMsgMatch) {
+          const field = fieldMatch[1];
+          const targetPanelMsgId = parseInt(panelMsgMatch[1], 10);
+          const pKey = pKeyMatch ? pKeyMatch[1] : "zeus";
+          
+          const cfg = parseConfigFromText(replyTo);
+
+          if (field === "WRK") cfg.workerName = text.replace(/[^a-zA-Z0-9_-]/g, "");
+          if (field === "D1N") cfg.d1Name = text.replace(/[^a-zA-Z0-9_-]/g, "");
+          if (field === "BND") cfg.bindingName = text.replace(/[^a-zA-Z0-9_]/g, "");
+
+          const state = {
+            act: "view",
+            pKey: pKey,
+            obfuscate: flagsMatch ? flagsMatch[1] === "1" : true,
+            recreate: flagsMatch ? flagsMatch[2] === "1" : true,
+            d1: flagsMatch ? flagsMatch[3] === "1" : true,
+          };
+
+          await renderReviewMenu(BOT_TOKEN, chatId, targetPanelMsgId, cfg, state, pKey);
+
+          try {
+            await tgApi(BOT_TOKEN, "deleteMessage", { chat_id: chatId, message_id: update.message.message_id });
+            await tgApi(BOT_TOKEN, "deleteMessage", { chat_id: chatId, message_id: replyToMsg.message_id });
+          } catch (_) {}
+
+          return new Response("OK");
+        }
+      }
+
+      let presetKey = "nahan"; // پیش‌فرض امن
+
+      const prjMatch = replyTo.match(/\[#PRJ_([a-zA-Z0-9]+)#\]/i);
+      if (prjMatch && prjMatch[1]) {
+        const detected = prjMatch[1].toLowerCase();
+        if (PRESETS[detected]) {
+          presetKey = detected;
+        }
+      } else if (/نهان|nahan/i.test(replyTo)) {
+        presetKey = "nahan";
+      } else if (/زئوس|zeus/i.test(replyTo)) {
+        presetKey = "zeus";
+      } else if (/سفارشی|custom/i.test(replyTo)) {
+        presetKey = "custom";
+      }
+
+      const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+
+      if (lines.length < 2) {
+        await tgApi(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId,
+          text: `⚠️ لطفاً اطلاعات را در دو خط جداگانه بفرستید:\n\nخط ۱: Account ID\nخط ۲: API Token`,
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "🔑 ساخت خودکار API Token", url: TOKEN_CREATE_URL }],
+              [{ text: "❓ راهنمای پیدا کردن Account ID", callback_data: "help_acc_id" }],
+            ],
+          },
+        });
+        return new Response("OK");
+      }
+
+      const p = PRESETS[presetKey];
+      const cfg = {
+        accountId: lines[0],
+        apiToken: lines[1],
+        workerName: generateRandomName("cf"),
+        d1Name: generateRandomName("db"),
+        bindingName: p.binding,
+        scriptUrl: lines[2] || p.url,
+      };
+
+      const state = {
+        act: "view",
+        pKey: presetKey,
+        obfuscate: p.obfuscate === 1,
+        recreate: p.recreate === 1,
+        d1: p.d1 === 1,
+      };
+
+      try {
+        await tgApi(BOT_TOKEN, "deleteMessage", { chat_id: chatId, message_id: update.message.message_id });
+      } catch (_) {}
+
+      await renderReviewMenu(BOT_TOKEN, chatId, null, cfg, state, presetKey);
+      return new Response("OK");
+    }
+
+    return new Response("OK");
+  } catch (err) {
+    return new Response("Error: " + err.message, { status: 200 });
+  }
+}
+
+async function renderReviewMenu(botToken, chatId, messageId, cfg, state, pKey) {
+  const effectivePKey = pKey || state.pKey || "zeus";
+  const p = PRESETS[effectivePKey];
+  const obfFlag = state.obfuscate ? "1" : "0";
+  const clnFlag = state.recreate ? "1" : "0";
+  const d1Flag = state.d1 ? "1" : "0";
+  const kvFlag = state.kv ? "1" : "0";
+
+  const bindingName = cfg.bindingName || p.binding;
+  const kvBindingName = cfg.kvBindingName || "KV";
+  const scriptUrl = effectivePKey === "custom" ? (cfg.scriptUrl || "") : p.url;
+
+  const text = `📋 <b>تنظیمات استقرار ورکر: ${p.title}</b>
+
+🔹 <b>نام ورکر:</b> <code>${cfg.workerName}</code>
+🔹 <b>مبهم‌سازی کد:</b> ${state.obfuscate ? "روشن ✅" : "خاموش ❌"}
+🔹 <b>نصب تمیز (Clean):</b> ${state.recreate ? "روشن ✅" : "خاموش ❌"}
+🔹 <b>دیتابیس D1:</b> ${state.d1 ? `روشن (<code>${cfg.d1Name}</code>)` : "خاموش ❌"}
+🔹 <b>حافظه KV:</b> ${state.kv ? `روشن (<code>${cfg.kvName}</code>)` : "خاموش ❌"}
+
+<pre>
+PRJ: ${effectivePKey}
+ACC: ${cfg.accountId}
+TOK: ${cfg.apiToken}
+WRK: ${cfg.workerName}
+D1N: ${cfg.d1Name}
+BND: ${bindingName}
+KVN: ${cfg.kvName || ""}
+KVB: ${kvBindingName}
+URL: ${scriptUrl}
+</pre>`;
+
+  const keyboard = [
+    [
+      { text: "✏️ نام ورکر", callback_data: encodeAction("edit_wrk", effectivePKey, obfFlag, clnFlag, d1Flag, kvFlag) },
+      { text: "🎲 نام رندوم", callback_data: encodeAction("rnd_wrk", effectivePKey, obfFlag, clnFlag, d1Flag, kvFlag) },
+    ],
+    ...(state.d1
+      ? [
+          [
+            { text: "✏️ نام D1", callback_data: encodeAction("edit_d1n", effectivePKey, obfFlag, clnFlag, d1Flag, kvFlag) },
+            { text: "✏️ بایندینگ D1", callback_data: encodeAction("edit_bnd", effectivePKey, obfFlag, clnFlag, d1Flag, kvFlag) },
+            { text: "🎲 دیتابیس رندوم", callback_data: encodeAction("rnd_d1", effectivePKey, obfFlag, clnFlag, d1Flag, kvFlag) },
+          ],
+        ]
+      : []),
+    [
+      { text: `مبهم‌سازی: ${state.obfuscate ? "روشن 🟢" : "خاموش ⚪"}`, callback_data: encodeAction("tog_obf", effectivePKey, obfFlag, clnFlag, d1Flag, kvFlag) },
+      { text: `نصب Clean: ${state.recreate ? "روشن 🟢" : "خاموش ⚪"}`, callback_data: encodeAction("tog_cln", effectivePKey, obfFlag, clnFlag, d1Flag, kvFlag) },
+    ],
+    [
+      { text: `دیتابیس D1: ${state.d1 ? "روشن 🟢" : "خاموش ⚪"}`, callback_data: encodeAction("tog_d1", effectivePKey, obfFlag, clnFlag, d1Flag, kvFlag) },
+      { text: `حافظه KV: ${state.kv ? "روشن 🟢" : "خاموش ⚪"}`, callback_data: encodeAction("tog_kv", effectivePKey, obfFlag, clnFlag, d1Flag, kvFlag) },
+    ],
+    [
+      { text: `🚀 شروع استقرار ${p.title}`, callback_data: encodeAction("deploy", effectivePKey, obfFlag, clnFlag, d1Flag, kvFlag) },
+      { text: "❌ انصراف", callback_data: "cancel" },
+    ],
+  ];
+
+  if (messageId) {
+    await tgApi(botToken, "editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      parse_mode: "HTML",
+      text,
+      reply_markup: { inline_keyboard: keyboard },
+    });
+  } else {
+    await tgApi(botToken, "sendMessage", {
+      chat_id: chatId,
+      parse_mode: "HTML",
+      text,
+      reply_markup: { inline_keyboard: keyboard },
+    });
+  }
+}
+
+
+================================================
+FILE: .github/workflows/deploy.yml
+================================================
+name: Deploy Cloudflare Pages & Setup Telegram Bot
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Wrangler
+        run: npm install -g wrangler
+
+      - name: Ensure Pages Project Exists
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          wrangler pages project create jasaz --production-branch=main || true
+
+      - name: Sync Secrets to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_SECRET_TOKEN: ${{ secrets.TELEGRAM_SECRET_TOKEN }}
+        run: |
+          echo "Syncing Secrets..."
+          echo "$TELEGRAM_BOT_TOKEN" | wrangler pages secret put BOT_TOKEN --project-name=jasaz
+          echo "$TELEGRAM_SECRET_TOKEN" | wrangler pages secret put BOT_SECRET --project-name=jasaz
+
+      - name: Deploy to Cloudflare Pages
+        id: pages_deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          OUTPUT=$(wrangler pages deploy public --project-name=jasaz --commit-dirty=true)
+          echo "$OUTPUT"
+
+          PROJECT_NAME="jasaz"
+          CANONICAL_URL="https://${PROJECT_NAME}.pages.dev"
+
+          echo "Canonical URL: $CANONICAL_URL"
+          echo "pages_url=$CANONICAL_URL" >> $GITHUB_OUTPUT
+
+      - name: Auto-Register Telegram Webhook
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_SECRET_TOKEN: ${{ secrets.TELEGRAM_SECRET_TOKEN }}
+          PAGES_URL: ${{ steps.pages_deploy.outputs.pages_url }}
+        run: |
+          if [ -z "${TELEGRAM_BOT_TOKEN}" ]; then
+            echo "❌ ERROR: TELEGRAM_BOT_TOKEN secret is empty or not set in GitHub Repository Secrets!"
+            exit 1
+          fi
+
+          CLEAN_TOKEN=$(echo -n "${TELEGRAM_BOT_TOKEN}" | tr -d '[:space:]' | sed -e 's/^bot//')
+          CLEAN_SECRET=$(echo -n "${TELEGRAM_SECRET_TOKEN}" | tr -d '[:space:]')
+          
+          echo "Token format check: Length is ${#CLEAN_TOKEN} characters."
+
+          echo "Testing Bot Token with getMe..."
+          ME_RESPONSE=$(curl -s "https://api.telegram.org/bot${CLEAN_TOKEN}/getMe")
+          echo "getMe Response: $ME_RESPONSE"
+
+          if ! echo "$ME_RESPONSE" | grep -q '"ok":true'; then
+            echo "❌ The provided TELEGRAM_BOT_TOKEN is invalid or revoked by BotFather!"
+            exit 1
+          fi
+
+          WEBHOOK_URL="${PAGES_URL}/api/telegram-bot"
+          echo "Registering Webhook on: $WEBHOOK_URL"
+
+          RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${CLEAN_TOKEN}/setWebhook" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"url\": \"${WEBHOOK_URL}\",
+              \"secret_token\": \"${CLEAN_SECRET}\",
+              \"drop_pending_updates\": false
+            }")
+
+          echo "setWebhook Response: $RESPONSE"
+
+          if echo "$RESPONSE" | grep -q '"ok":true'; then
+            echo "✅ Telegram Webhook registered successfully!"
+          else
+            echo "❌ Failed to register Telegram Webhook!"
+            exit 1
+          fi

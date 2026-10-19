@@ -237,11 +237,6 @@ jobs:
       - name: Install wrangler
         run: npm install -g wrangler@4
 
-      - name: Build and Obfuscate Worker Bundle
-        run: |
-          npx wrangler deploy --dry-run --outdir dist
-          node scripts/obfuscate.js dist/index.js
-
       - name: "Deploy via Wrangler Action (${{ steps.worker.outputs.name }} → ${{ steps.account.outputs.label }})"
         id: deploy
         uses: cloudflare/wrangler-action@v4
@@ -249,7 +244,7 @@ jobs:
           apiToken: ${{ matrix.index == 1 && secrets.CLOUDFLARE_API_TOKEN || secrets[format('CLOUDFLARE_API_TOKEN_{0}', matrix.index)] }}
           accountId: ${{ matrix.index == 1 && secrets.CLOUDFLARE_ACCOUNT_ID || secrets[format('CLOUDFLARE_ACCOUNT_ID_{0}', matrix.index)] }}
           wranglerVersion: "4.86.0"
-          command: deploy dist/index.js --name ${{ steps.worker.outputs.name }}
+          command: deploy --name ${{ steps.worker.outputs.name }}
           vars: |
             UUID
             PROXYIP

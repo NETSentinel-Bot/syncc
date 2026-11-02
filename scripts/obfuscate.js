@@ -123,9 +123,8 @@ function obfuscateWorkerCode(code) {
       const prevTrimmed = output.trimEnd();
       const isImportExport = /(?:from|import)\s*$/.test(prevTrimmed);
       const isDirective = rawVal === "use strict";
-      const isWasmFile = rawVal && (rawVal.endsWith(".wasm") || rawVal.includes("zr_wasm"));
 
-      if (isImportExport || isDirective || isWasmFile || !rawVal || rawVal.length === 0) {
+      if (isImportExport || isDirective || !rawVal || rawVal.length === 0) {
         output += strLiteral;
         i = strEnd;
         continue;

@@ -1,8 +1,201 @@
 import { connect } from "cloudflare:sockets";
-import { processHeader } from "../pkg/zr_wasm.js";
 import { CONST, safeFetch } from "./core.js";
 
 const IPV4_REGEX = /^\d{1,3}(\.\d{1,3}){3}$/;
+
+const byteToHex = Array.from({ length: 256 }, (_, i) => (i + 0x100).toString(16).slice(1));
+
+function unsafeStringify(arr, offset = 0) {
+  return (
+    byteToHex[arr[offset]] +
+    byteToHex[arr[offset + 1]] +
+    byteToHex[arr[offset + 2]] +
+    byteToHex[arr[offset + 3]] +
+    "-" +
+    byteToHex[arr[offset + 4]] +
+    byteToHex[arr[offset + 5]] +
+    "-" +
+    byteToHex[arr[offset + 6]] +
+    byteToHex[arr[offset + 7]] +
+    "-" +
+    byteToHex[arr[offset + 8]] +
+    byteToHex[arr[offset + 9]] +
+    "-" +
+    byteToHex[arr[offset + 10]] +
+    byteToHex[arr[offset + 11]] +
+    byteToHex[arr[offset + 12]] +
+    byteToHex[arr[offset + 13]] +
+    byteToHex[arr[offset + 14]] +
+    byteToHex[arr[offset + 15]]
+  ).toLowerCase();
+}
+
+export function parseHeader(chunk, userIDs) {
+  const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+  if (bytes.byteLength < 24) {
+    return {
+      has_error: true,
+      message: "invalid data",
+      address_remote: "",
+      port_remote: 0,
+      raw_data_index: 0,
+      is_udp: false,
+      version: 0,
+    };
+  }
+
+  const version = bytes[0];
+  const clientUUID = unsafeStringify(bytes, 1);
+  const uuids = (userIDs || "").split(",").map((id) => id.trim().toLowerCase());
+  const isValidUser = uuids.includes(clientUUID);
+
+  if (!isValidUser) {
+    return {
+      has_error: true,
+      message: "invalid user",
+      address_remote: "",
+      port_remote: 0,
+      raw_data_index: 0,
+      is_udp: false,
+      version,
+    };
+  }
+
+  const optLength = bytes[17];
+  const commandIndex = 18 + optLength;
+  if (bytes.byteLength <= commandIndex) {
+    return {
+      has_error: true,
+      message: "invalid data",
+      address_remote: "",
+      port_remote: 0,
+      raw_data_index: 0,
+      is_udp: false,
+      version,
+    };
+  }
+
+  const command = bytes[commandIndex];
+  if (command !== 1 && command !== 2) {
+    return {
+      has_error: true,
+      message: `command ${command} is not supported`,
+      address_remote: "",
+      port_remote: 0,
+      raw_data_index: 0,
+      is_udp: false,
+      version,
+    };
+  }
+  const isUdp = command === 2;
+
+  const portIndex = commandIndex + 1;
+  if (bytes.byteLength < portIndex + 3) {
+    return {
+      has_error: true,
+      message: "invalid data",
+      address_remote: "",
+      port_remote: 0,
+      raw_data_index: 0,
+      is_udp: isUdp,
+      version,
+    };
+  }
+
+  const portRemote = (bytes[portIndex] << 8) | bytes[portIndex + 1];
+  const addressType = bytes[portIndex + 2];
+  let currentIdx = portIndex + 3;
+  let addressRemote = "";
+
+  switch (addressType) {
+    case 1: { // IPv4
+      if (bytes.byteLength < currentIdx + 4) {
+        return {
+          has_error: true,
+          message: "invalid data",
+          address_remote: "",
+          port_remote: portRemote,
+          raw_data_index: 0,
+          is_udp: isUdp,
+          version,
+        };
+      }
+      addressRemote = `${bytes[currentIdx]}.${bytes[currentIdx + 1]}.${bytes[currentIdx + 2]}.${bytes[currentIdx + 3]}`;
+      currentIdx += 4;
+      break;
+    }
+    case 2: { // Domain
+      if (bytes.byteLength < currentIdx + 1) {
+        return {
+          has_error: true,
+          message: "invalid data",
+          address_remote: "",
+          port_remote: portRemote,
+          raw_data_index: 0,
+          is_udp: isUdp,
+          version,
+        };
+      }
+      const addressLength = bytes[currentIdx];
+      currentIdx += 1;
+      if (bytes.byteLength < currentIdx + addressLength) {
+        return {
+          has_error: true,
+          message: "invalid data",
+          address_remote: "",
+          port_remote: portRemote,
+          raw_data_index: 0,
+          is_udp: isUdp,
+          version,
+        };
+      }
+      addressRemote = new TextDecoder().decode(bytes.slice(currentIdx, currentIdx + addressLength));
+      currentIdx += addressLength;
+      break;
+    }
+    case 3: { // IPv6
+      if (bytes.byteLength < currentIdx + 16) {
+        return {
+          has_error: true,
+          message: "invalid data",
+          address_remote: "",
+          port_remote: portRemote,
+          raw_data_index: 0,
+          is_udp: isUdp,
+          version,
+        };
+      }
+      const segments = [];
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      for (let i = 0; i < 8; i++) {
+        segments.push(view.getUint16(currentIdx + i * 2).toString(16));
+      }
+      addressRemote = segments.join(":");
+      currentIdx += 16;
+      break;
+    }
+    default:
+      return {
+        has_error: true,
+        message: `invalid addressType: ${addressType}`,
+        address_remote: "",
+        port_remote: portRemote,
+        raw_data_index: 0,
+        is_udp: isUdp,
+        version,
+      };
+  }
+
+  return {
+    has_error: false,
+    message: "success",
+    address_remote: addressRemote,
+    port_remote: portRemote,
+    raw_data_index: currentIdx,
+    is_udp: isUdp,
+    version,
+  };
+}
 
 async function resolveIPv4(hostname) {
   if (IPV4_REGEX.test(hostname)) return hostname;
@@ -114,7 +307,7 @@ export async function ProtocolOverWSHandler(request, config) {
             return;
           }
           
-          const header = processHeader(new Uint8Array(chunk), config.userID);
+          const header = parseHeader(chunk, config.userID);
           if (header.has_error) throw new Error(header.message);
 
           address = header.address_remote;

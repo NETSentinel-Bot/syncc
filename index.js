@@ -1,5 +1,3 @@
-import init from "./pkg/zr_wasm.js";
-import wasm from "./pkg/zr_wasm_bg.wasm";
 import { handleClashConfig } from "./src/clash.js";
 import { ProtocolOverWSHandler } from "./src/network.js";
 import { Config, buildSettingsUrl } from "./src/core.js";
@@ -11,24 +9,6 @@ import {
   handleProxyIpsInfo,
   handleProxyHostInfo,
 } from "./src/routes.js";
-
-let wasmReady = null;
-function ensureWasm() {
-  if (!wasmReady) {
-    try {
-      wasmReady = init({ module_or_path: wasm }).catch((e) => {
-        wasmReady = null;
-        console.error("Async WASM initialization failed:", e);
-        throw e;
-      });
-    } catch (e) {
-      wasmReady = null;
-      console.error("Sync WASM init call threw error:", e);
-      throw e;
-    }
-  }
-  return wasmReady;
-}
 
 function notFoundPage(hostName, workerName) {
   const settingsUrl = buildSettingsUrl(workerName);
@@ -97,12 +77,6 @@ export default {
       const upgradeHeader = request.headers.get("Upgrade");
 
       if (upgradeHeader && upgradeHeader.toLowerCase() === "websocket") {
-        try {
-          await ensureWasm();
-        } catch (wasmErr) {
-          console.error("WASM module initialization failed:", wasmErr);
-          return new Response(`WASM Error: ${wasmErr.message || wasmErr}`, { status: 500 });
-        }
         return await ProtocolOverWSHandler(request, {
           userID: cfg.userID,
           proxyPool: cfg.proxyPool,

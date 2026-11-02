@@ -97,17 +97,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install wasm-pack
-        uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-pack
-
       - name: Resolve account credentials (#${{ matrix.index }})
         id: account
         env:

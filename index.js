@@ -18,7 +18,7 @@ function notFoundPage(hostName, workerName) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Oops. Not Found</title>
+<title>Service Gateway</title>
 <style>
   body {
     background: #0d1117;
@@ -60,10 +60,10 @@ function notFoundPage(hostName, workerName) {
 </head>
 <body>
   <div class="box">
-    <h1>No UUID found in this URL</h1>
-    <p>This worker needs a valid UUID in the path to know who you are.</p>
-    <p>Try visiting <code>https://${hostName}/&lt;your-uuid&gt;</code></p>
-    <a class="btn" href="${settingsUrl}" target="_blank" rel="noopener noreferrer">🔑 Find your UUID on Cloudflare</a>
+    <h1>Access Key Required</h1>
+    <p>This endpoint requires a valid authorization token in the request path.</p>
+    <p>Try visiting <code>https://${hostName}/&lt;access-key&gt;</code></p>
+    <a class="btn" href="${settingsUrl}" target="_blank" rel="noopener noreferrer">🔑 View Configuration on Cloudflare</a>
   </div>
 </body>
 </html>`;

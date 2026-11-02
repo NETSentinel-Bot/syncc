@@ -1,5 +1,4 @@
 const fs = require("fs");
-const path = require("path");
 
 const XOR_KEY = 0x4f;
 
@@ -12,7 +11,16 @@ function encodeStringToTable(str, key) {
   return btoa(out);
 }
 
-function obfuscateWorkerCode(code) {
+function evaluateTemplateRawChunk(raw) {
+  // Evaluates a raw template chunk (e.g. `\n`, `\"`, `hello\nworld`) as real JS string
+  try {
+    return new Function("return `" + raw.replace(/`/g, "\\`").replace(/\$\{/g, "\\${") + "`;")();
+  } catch (e) {
+    return raw;
+  }
+}
+
+function obfuscateCode(code) {
   const stringTable = [];
   const stringIndexMap = new Map();
 
@@ -24,7 +32,7 @@ function obfuscateWorkerCode(code) {
     return idx;
   }
 
-  // Extract top-level imports to ensure ES module imports stay at the very top of the file
+  // Extract top-level imports
   const lines = code.split("\n");
   const importLines = [];
   const bodyLines = [];
@@ -38,125 +46,265 @@ function obfuscateWorkerCode(code) {
   }
 
   const bodyCode = bodyLines.join("\n");
-  let i = 0;
   const len = bodyCode.length;
-  let output = "";
 
-  while (i < len) {
-    const char = bodyCode[i];
-    const nextChar = i + 1 < len ? bodyCode[i + 1] : "";
+  function processCode(source, start = 0, end = len) {
+    let i = start;
+    let out = "";
 
-    if (char === "/" && nextChar === "/") {
-      const end = bodyCode.indexOf("\n", i);
-      if (end === -1) { output += bodyCode.slice(i); break; }
-      output += bodyCode.slice(i, end);
-      i = end;
-      continue;
-    }
-
-    if (char === "/" && nextChar === "*") {
-      const end = bodyCode.indexOf("*/", i + 2);
-      if (end === -1) { output += bodyCode.slice(i); break; }
-      output += bodyCode.slice(i, end + 2);
-      i = end + 2;
-      continue;
-    }
-
-    if (char === "`") {
-      let end = i + 1;
-      while (end < len) {
-        if (bodyCode[end] === "\\") end += 2;
-        else if (bodyCode[end] === "`") { end++; break; }
-        else end++;
-      }
-      output += bodyCode.slice(i, end);
-      i = end;
-      continue;
-    }
-
-    if (char === "/") {
-      const trimmed = output.trimEnd();
+    function isRegexAt(idx, currentOutput) {
+      const trimmed = currentOutput.trimEnd();
       const lastChar = trimmed.slice(-1);
-      const isRegex = !lastChar || "(=:[,!&|?;{}~^+*%-".includes(lastChar) || /(?:return|case|delete|throw|typeof)\s*$/.test(trimmed);
+      return !lastChar || "(=:[,!&|?;{}~^+*%-".includes(lastChar) || /(?:return|case|delete|throw|typeof)\s*$/.test(trimmed);
+    }
 
-      if (isRegex) {
-        let end = i + 1;
-        let inClass = false;
-        while (end < len) {
-          if (bodyCode[end] === "\\") end += 2;
-          else if (bodyCode[end] === "[" && !inClass) { inClass = true; end++; }
-          else if (bodyCode[end] === "]" && inClass) { inClass = false; end++; }
-          else if (bodyCode[end] === "/" && !inClass) {
-            end++;
-            while (end < len && /[gimsuy]/.test(bodyCode[end])) end++;
-            break;
-          } else end++;
-        }
-        output += bodyCode.slice(i, end);
-        i = end;
+    while (i < end) {
+      const char = source[i];
+      const nextChar = i + 1 < end ? source[i + 1] : "";
+
+      // Single line comments
+      if (char === "/" && nextChar === "/") {
+        const nextNl = source.indexOf("\n", i);
+        const commentEnd = (nextNl === -1 || nextNl > end) ? end : nextNl;
+        out += source.slice(i, commentEnd);
+        i = commentEnd;
         continue;
       }
-    }
 
-    if (char === '"' || char === "'") {
-      const quote = char;
-      const strStart = i;
-      let strEnd = i + 1;
-
-      while (strEnd < len) {
-        if (bodyCode[strEnd] === "\\") strEnd += 2;
-        else if (bodyCode[strEnd] === quote) { strEnd++; break; }
-        else if (bodyCode[strEnd] === "\n") break;
-        else strEnd++;
+      // Multi line comments
+      if (char === "/" && nextChar === "*") {
+        const nextStar = source.indexOf("*/", i + 2);
+        const commentEnd = (nextStar === -1 || nextStar + 2 > end) ? end : nextStar + 2;
+        out += source.slice(i, commentEnd);
+        i = commentEnd;
+        continue;
       }
 
-      const strLiteral = bodyCode.slice(strStart, strEnd);
-      let rawVal = null;
-      try {
-        rawVal = quote === '"'
-          ? JSON.parse(strLiteral)
-          : JSON.parse(`"${strLiteral.slice(1, -1).replace(/\\'/g, "'").replace(/"/g, '\\"')}"`);
-      } catch {
-        rawVal = strLiteral.slice(1, -1);
+      // Regex literals
+      if (char === "/") {
+        if (isRegexAt(i, out)) {
+          let k = i + 1;
+          let inClass = false;
+          while (k < end) {
+            if (source[k] === "\\") k += 2;
+            else if (source[k] === "[" && !inClass) { inClass = true; k++; }
+            else if (source[k] === "]" && inClass) { inClass = false; k++; }
+            else if (source[k] === "/" && !inClass) {
+              k++;
+              while (k < end && /[gimsuy]/.test(source[k])) k++;
+              break;
+            } else k++;
+          }
+          out += source.slice(i, k);
+          i = k;
+          continue;
+        }
       }
 
-      const prevTrimmed = output.trimEnd();
-      const isImportExport = /(?:from|import)\s*$/.test(prevTrimmed);
-      const isDirective = rawVal === "use strict";
+      // Normal strings ('...' or "...")
+      if (char === '"' || char === "'") {
+        const quote = char;
+        const strStart = i;
+        let strEnd = i + 1;
 
-      if (isImportExport || isDirective || !rawVal || rawVal.length === 0) {
-        output += strLiteral;
+        while (strEnd < end) {
+          if (source[strEnd] === "\\") strEnd += 2;
+          else if (source[strEnd] === quote) { strEnd++; break; }
+          else if (source[strEnd] === "\n") break;
+          else strEnd++;
+        }
+
+        const strLiteral = source.slice(strStart, strEnd);
+        let rawVal = null;
+        try {
+          rawVal = quote === '"'
+            ? JSON.parse(strLiteral)
+            : JSON.parse(`"${strLiteral.slice(1, -1).replace(/\\'/g, "'").replace(/"/g, '\\"')}"`);
+        } catch {
+          rawVal = strLiteral.slice(1, -1);
+        }
+
+        const prevTrimmed = out.trimEnd();
+        const isImportExport = /(?:from|import)\s*$/.test(prevTrimmed);
+        const isDirective = rawVal === "use strict";
+
+        if (isImportExport || isDirective || !rawVal || rawVal.length === 0) {
+          out += strLiteral;
+          i = strEnd;
+          continue;
+        }
+
+        let k = strEnd;
+        while (k < end && (source[k] === " " || source[k] === "\t" || source[k] === "\r" || source[k] === "\n")) k++;
+        const isFollowedByColon = (source[k] === ":" && source[k + 1] !== ":");
+        const lastToken = prevTrimmed.slice(-1);
+        const isTernaryOrCondition = lastToken === "?" || /(?:case)\s*$/.test(prevTrimmed);
+
+        if (isFollowedByColon && !isTernaryOrCondition) {
+          out += strLiteral;
+        } else {
+          const idx = getOrAddString(rawVal);
+          out += `_0x_dec_fn(${idx})`;
+        }
+
         i = strEnd;
         continue;
       }
 
-      let k = strEnd;
-      while (k < len && (bodyCode[k] === " " || bodyCode[k] === "\t" || bodyCode[k] === "\r" || bodyCode[k] === "\n")) k++;
-      const isFollowedByColon = (bodyCode[k] === ":" && bodyCode[k + 1] !== ":");
-      const lastToken = prevTrimmed.slice(-1);
-      const isTernaryOrCondition = lastToken === "?" || /(?:case)\s*$/.test(prevTrimmed);
+      // Template literals (`...`)
+      if (char === "`") {
+        let k = i + 1;
+        const parts = [];
+        let rawChunk = "";
 
-      if (isFollowedByColon && !isTernaryOrCondition) {
-        output += strLiteral;
-      } else {
-        const idx = getOrAddString(rawVal);
-        output += `func_dec(${idx})`;
+        while (k < end) {
+          const c = source[k];
+          if (c === "\\") {
+            rawChunk += source.slice(k, k + 2);
+            k += 2;
+          } else if (c === "`") {
+            if (rawChunk.length > 0) {
+              const val = evaluateTemplateRawChunk(rawChunk);
+              if (val.length > 0) {
+                const idx = getOrAddString(val);
+                parts.push(`_0x_dec_fn(${idx})`);
+              }
+            }
+            k++;
+            break;
+          } else if (c === "$" && source[k + 1] === "{") {
+            if (rawChunk.length > 0) {
+              const val = evaluateTemplateRawChunk(rawChunk);
+              if (val.length > 0) {
+                const idx = getOrAddString(val);
+                parts.push(`_0x_dec_fn(${idx})`);
+              }
+              rawChunk = "";
+            }
+            k += 2; // skip ${
+
+            // Parse expression inside ${...}
+            let depth = 1;
+            const exprStart = k;
+
+            while (k < end && depth > 0) {
+              const ec = source[k];
+              const enc = k + 1 < end ? source[k + 1] : "";
+
+              if (ec === "/" && enc === "/") {
+                const nextNl = source.indexOf("\n", k);
+                k = nextNl === -1 ? end : nextNl;
+                continue;
+              }
+              if (ec === "/" && enc === "*") {
+                const nextStar = source.indexOf("*/", k + 2);
+                k = nextStar === -1 ? end : nextStar + 2;
+                continue;
+              }
+              if (ec === '"' || ec === "'") {
+                const eq = ec;
+                k++;
+                while (k < end) {
+                  if (source[k] === "\\") k += 2;
+                  else if (source[k] === eq) { k++; break; }
+                  else if (source[k] === "\n") break;
+                  else k++;
+                }
+                continue;
+              }
+              // Nested template literal inside expression!
+              if (ec === "`") {
+                k++;
+                let nestedDepth = 0;
+                while (k < end) {
+                  if (source[k] === "\\") k += 2;
+                  else if (source[k] === "`" && nestedDepth === 0) { k++; break; }
+                  else if (source[k] === "$" && source[k + 1] === "{") {
+                    nestedDepth++;
+                    k += 2;
+                  } else if (source[k] === "}" && nestedDepth > 0) {
+                    nestedDepth--;
+                    k++;
+                  } else {
+                    k++;
+                  }
+                }
+                continue;
+              }
+              if (ec === "/") {
+                // Check if regex
+                const subOut = source.slice(exprStart, k);
+                if (isRegexAt(k, subOut)) {
+                  k++;
+                  let inClass = false;
+                  while (k < end) {
+                    if (source[k] === "\\") k += 2;
+                    else if (source[k] === "[" && !inClass) { inClass = true; k++; }
+                    else if (source[k] === "]" && inClass) { inClass = false; k++; }
+                    else if (source[k] === "/" && !inClass) {
+                      k++;
+                      while (k < end && /[gimsuy]/.test(source[k])) k++;
+                      break;
+                    } else k++;
+                  }
+                  continue;
+                }
+              }
+              if (ec === "{") {
+                depth++;
+                k++;
+                continue;
+              }
+              if (ec === "}") {
+                depth--;
+                if (depth === 0) {
+                  // End of ${...}
+                  const exprCode = source.slice(exprStart, k);
+                  // Recursively process the expression so any strings or nested templates inside it are also obfuscated!
+                  const processedExpr = processCode(exprCode, 0, exprCode.length);
+                  parts.push(`(${processedExpr})`);
+                  k++;
+                  break;
+                }
+                k++;
+                continue;
+              }
+              k++;
+            }
+          } else {
+            rawChunk += c;
+            k++;
+          }
+        }
+
+        if (parts.length === 0) {
+          const emptyIdx = getOrAddString("");
+          out += `_0x_dec_fn(${emptyIdx})`;
+        } else if (parts.length === 1) {
+          out += parts[0];
+        } else {
+          out += "(" + parts.join(" + ") + ")";
+        }
+
+        i = k;
+        continue;
       }
 
-      i = strEnd;
-      continue;
+      out += char;
+      i++;
     }
 
-    output += char;
-    i++;
+    return out;
   }
+
+  const processedBody = processCode(bodyCode);
 
   const runtimeHeader = `// @ts-nocheck
 const _0x_key = ${XOR_KEY};
 const _0x_tbl = ${JSON.stringify(stringTable)};
 const _0x_cache = new Map();
 const _0x_dec = new TextDecoder();
-function func_dec(idx) {
+function _0x_dec_fn(idx) {
   if (_0x_cache.has(idx)) return _0x_cache.get(idx);
   const raw = atob(_0x_tbl[idx]);
   const bytes = new Uint8Array(raw.length);
@@ -169,8 +317,52 @@ function func_dec(idx) {
 }
 `;
   const importsHeader = importLines.length > 0 ? importLines.join("\n") + "\n" : "";
-  const cleanedOutput = output.replace(/\/\/#\s*sourceMappingURL=.*$/gm, "");
+  const cleanedOutput = processedBody.replace(/\/\/#\s*sourceMappingURL=.*$/gm, "");
   return importsHeader + runtimeHeader + "\n" + cleanedOutput;
+}
+
+/**
+ * Minify identifiers & syntax safely using esbuild if available,
+ * keeping Cloudflare Workers compatibility.
+ */
+function minifyBundle(filePath) {
+  try {
+    const esbuildPath = require.resolve("esbuild", {
+      paths: [process.cwd(), __dirname, ...module.paths],
+    });
+    if (esbuildPath) {
+      const esbuild = require(esbuildPath);
+      const code = fs.readFileSync(filePath, "utf8");
+      const result = esbuild.transformSync(code, {
+        minifyIdentifiers: true,
+        minifySyntax: true,
+        minifyWhitespace: false,
+        target: "es2022",
+        format: "esm",
+      });
+      if (result && result.code) {
+        fs.writeFileSync(filePath, result.code, "utf8");
+        console.log("Identifiers and syntax minified successfully via esbuild.");
+      }
+    }
+  } catch (err) {
+    try {
+      const { execFileSync } = require("child_process");
+      execFileSync("npx", [
+        "esbuild",
+        filePath,
+        "--bundle=false",
+        "--minify-identifiers",
+        "--minify-syntax",
+        "--target=es2022",
+        `--outfile=${filePath}`,
+        "--allow-overwrite",
+      ], { stdio: "inherit" });
+      console.log("Identifiers and syntax minified via npx esbuild.");
+    } catch (e) {
+      console.warn("esbuild minification skipped:", e.message);
+    }
+  }
 }
 
 function main() {
@@ -182,15 +374,19 @@ function main() {
 
   const code = fs.readFileSync(targetFile, "utf8");
   console.log(`Obfuscating ${targetFile} (${code.length} bytes)...`);
-  const obfuscated = obfuscateWorkerCode(code);
+  const obfuscated = obfuscateCode(code);
   fs.writeFileSync(targetFile, obfuscated, "utf8");
+
+  // Minify identifiers and structure to completely obscure variable and function names
+  minifyBundle(targetFile);
 
   const mapFile = `${targetFile}.map`;
   if (fs.existsSync(mapFile)) {
     fs.rmSync(mapFile, { force: true });
   }
 
-  console.log(`Obfuscated successfully (${obfuscated.length} bytes).`);
+  const finalCode = fs.readFileSync(targetFile, "utf8");
+  console.log(`Obfuscated successfully (${finalCode.length} bytes).`);
 }
 
 main();

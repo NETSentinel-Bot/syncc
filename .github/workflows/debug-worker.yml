@@ -12,6 +12,10 @@ on:
           - baseline
           - plain
           - obfuscated
+          - core
+          - clash
+          - network
+          - routes
         default: baseline
 
 permissions:
@@ -51,6 +55,56 @@ jobs:
       - name: Deploy baseline Worker
         if: inputs.test == 'baseline'
         run: wrangler deploy --config wrangler.debug.toml
+
+      - name: Prepare module probe
+        if: inputs.test == 'core' || inputs.test == 'clash' || inputs.test == 'network' || inputs.test == 'routes'
+        env:
+          DEBUG_TEST: ${{ inputs.test }}
+        run: |
+          case "$DEBUG_TEST" in
+            core)
+              module="core"
+              worker="syncc-1101-debug-probe-core"
+              ;;
+            clash)
+              module="clash"
+              worker="syncc-1101-debug-probe-clash"
+              ;;
+            network)
+              module="network"
+              worker="syncc-1101-debug-probe-network"
+              ;;
+            routes)
+              module="routes"
+              worker="syncc-1101-debug-probe-routes"
+              base64 -w0 index.html > src/panel.b64
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+
+          echo "PROBE_MODULE=$module" >> "$GITHUB_ENV"
+          echo "PROBE_WORKER=$worker" >> "$GITHUB_ENV"
+
+          cat > wrangler.probe.debug.toml <<EOF
+          name = "$worker"
+          main = "debug/probe-$module.js"
+          compatibility_date = "2025-09-01"
+
+          [[rules]]
+          type = "Text"
+          globs = ["**/*.b64"]
+          fallthrough = true
+          EOF
+
+      - name: Bundle module probe
+        if: inputs.test == 'core' || inputs.test == 'clash' || inputs.test == 'network' || inputs.test == 'routes'
+        run: wrangler deploy --dry-run --outdir dist --config wrangler.probe.debug.toml
+
+      - name: Deploy module probe
+        if: inputs.test == 'core' || inputs.test == 'clash' || inputs.test == 'network' || inputs.test == 'routes'
+        run: wrangler deploy "dist/probe-$PROBE_MODULE.js" --config wrangler.probe.debug.toml --name "$PROBE_WORKER"
 
       - name: Prepare source asset
         if: inputs.test == 'plain' || inputs.test == 'obfuscated'

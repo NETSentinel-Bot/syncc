@@ -16,7 +16,12 @@ on:
           - clash
           - network
           - routes
-        default: baseline
+          - core-config
+          - core-constants
+          - core-utils
+          - core-async
+          - clash-runtime
+          - routes-panel
 
 permissions:
   contents: read

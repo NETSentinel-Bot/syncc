@@ -99,7 +99,7 @@ jobs:
           echo "PROBE_MODULE=$module" >> "$GITHUB_ENV"
           echo "PROBE_WORKER=$worker" >> "$GITHUB_ENV"
           
-          cat > wrangler.probe.debug.toml <<EOF
+          cat > wrangler.debug.toml <<EOF
           name = "$worker"
           main = "debug/probe-$module.js"
           compatibility_date = "2025-09-01"
@@ -112,11 +112,11 @@ jobs:
 
       - name: Bundle module probe
         if: contains(fromJSON('["core","clash","network","routes","core-config","core-constants","core-utils","core-async","clash-runtime","routes-panel"]'), inputs.test)
-        run: wrangler deploy --dry-run --outdir dist --config wrangler.probe.debug.toml
+        run: wrangler deploy --dry-run --outdir dist --config wrangler.debug.toml
 
       - name: Deploy module probe
         if: contains(fromJSON('["core","clash","network","routes","core-config","core-constants","core-utils","core-async","clash-runtime","routes-panel"]'), inputs.test)
-        run: wrangler deploy "dist/probe-$PROBE_MODULE.js" --config wrangler.probe.debug.toml --name "$PROBE_WORKER"
+        run: wrangler deploy "dist/probe-$PROBE_MODULE.js" --config wrangler.debug.toml --name "$PROBE_WORKER"
 
       - name: Prepare source asset
         if: inputs.test == 'plain' || inputs.test == 'obfuscated'

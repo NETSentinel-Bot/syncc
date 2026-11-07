@@ -379,6 +379,11 @@ async function HandleTCPOutBound(
     const writer = tcpSocket.writable.getWriter();
     try {
       await writer.write(rawClientData);
+      log("TCP write completed", {
+        byteLength: rawClientData.byteLength,
+        host: formattedHost,
+        port: Number(port),
+      });
       log(`connected to ${formattedHost}:${port}`);
       return tcpSocket;
     } catch (error) {
@@ -479,69 +484,138 @@ function MakeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
     start(controller) {
       webSocketServer.addEventListener("message", (event) => {
         try {
-          controller.enqueue(event.data);
+          const data = event.data;
+          log("WebSocket message received", {
+            type: Object.prototype.toString.call(data),
+            byteLength: data?.byteLength ?? data?.size ?? null,
+          });
+          controller.enqueue(data);
         } catch (error) {
+          log("WebSocket message enqueue failed", {
+            message: error?.message,
+            stack: error?.stack,
+          });
           safeCloseWebSocket(webSocketServer);
         }
       });
+
       webSocketServer.addEventListener("close", () => {
         safeCloseWebSocket(webSocketServer);
         try {
           controller.close();
         } catch (error) {
-          log("stream already closed");
+          log("WebSocket stream already closed");
         }
       });
-      webSocketServer.addEventListener("error", (err) => {
-        log("webSocketServer has error");
-        controller.error(err);
+
+      webSocketServer.addEventListener("error", (error) => {
+        log("WebSocket server error", {
+          message: error?.message,
+        });
+        controller.error(error);
       });
+
       const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
-      if (error) controller.error(error);
-      else if (earlyData) controller.enqueue(earlyData);
+
+      if (error) {
+        log("Early Data decoding failed", {
+          message: error?.message,
+        });
+        controller.error(error);
+      } else if (earlyData) {
+        log("Early Data received", {
+          byteLength: earlyData.byteLength,
+        });
+        controller.enqueue(earlyData);
+      }
     },
-    pull(_controller) {},
+
+    pull() {},
+
     cancel(reason) {
-      log(`ReadableStream was canceled, due to ${reason}`);
+      log("WebSocket stream canceled", {
+        reason: String(reason),
+      });
       safeCloseWebSocket(webSocketServer);
     },
   });
 }
 
-async function RemoteSocketToWS(remoteSocket, webSocket, protocolResponseHeader, retry, log) {
+async function RemoteSocketToWS(
+  remoteSocket,
+  webSocket,
+  protocolResponseHeader,
+  retry,
+  log,
+) {
   let hasIncomingData = false;
   let headerSent = false;
+
+  log("RemoteSocketToWS started");
 
   try {
     await remoteSocket.readable.pipeTo(
       new WritableStream({
         async write(chunk) {
-          if (webSocket.readyState !== CONST.WS_READY_STATE_OPEN)
+          log("TCP data received", {
+            byteLength: chunk.byteLength,
+            webSocketState: webSocket.readyState,
+          });
+
+          if (webSocket.readyState !== CONST.WS_READY_STATE_OPEN) {
             throw new Error("WebSocket is not open");
+          }
+
           hasIncomingData = true;
 
           let dataToSend = chunk;
+
           if (!headerSent && protocolResponseHeader) {
-            const merged = new Uint8Array(protocolResponseHeader.length + chunk.byteLength);
+            const merged = new Uint8Array(
+              protocolResponseHeader.length + chunk.byteLength,
+            );
+
             merged.set(protocolResponseHeader, 0);
             merged.set(new Uint8Array(chunk), protocolResponseHeader.length);
+
             dataToSend = merged.buffer;
             headerSent = true;
           }
 
           webSocket.send(dataToSend);
+
+          log("TCP data forwarded to WebSocket", {
+            byteLength: dataToSend.byteLength,
+          });
         },
+
         close() {
-          log(`Remote connection readable closed.`);
+          log("TCP-to-WebSocket stream completed", {
+            hasIncomingData,
+            headerSent,
+          });
         },
+
         abort(reason) {
-          console.error(`Remote connection readable aborted:`, reason);
+          log("TCP-to-WebSocket stream aborted", {
+            reason: String(reason),
+          });
         },
       }),
     );
   } catch (error) {
-    console.error(`RemoteSocketToWS error:`, error.stack || error);
+    log("RemoteSocketToWS failed", {
+      name: error?.name,
+      message: error?.message,
+      stack: error?.stack,
+      hasIncomingData,
+    });
   }
+
+  log("RemoteSocketToWS completed", {
+    hasIncomingData,
+    retryAvailable: Boolean(retry),
+  });
 
   if (!hasIncomingData && retry) {
     try {
@@ -552,6 +626,7 @@ async function RemoteSocketToWS(remoteSocket, webSocket, protocolResponseHeader,
     }
     return;
   }
+
   safeCloseWebSocket(webSocket);
 }
 

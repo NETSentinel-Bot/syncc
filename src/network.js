@@ -570,16 +570,22 @@ async function RemoteSocketToWS(
 
           let dataToSend = chunk;
 
-          if (!headerSent && protocolResponseHeader) {
-            const merged = new Uint8Array(
-              protocolResponseHeader.length + chunk.byteLength,
-            );
-
-            merged.set(protocolResponseHeader, 0);
-            merged.set(new Uint8Array(chunk), protocolResponseHeader.length);
-
-            dataToSend = merged.buffer;
-            headerSent = true;
+          if (!hasIncomingData && retry) {
+            log("Retry started");
+          
+            try {
+              await retry();
+              log("Retry completed");
+            } catch (error) {
+              log("Retry failed", {
+                name: error?.name,
+                message: error?.message,
+                stack: error?.stack,
+              });
+              safeCloseWebSocket(webSocket);
+            }
+          
+            return;
           }
 
           webSocket.send(dataToSend);

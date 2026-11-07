@@ -62,7 +62,7 @@ jobs:
         run: wrangler deploy --config wrangler.debug.toml
 
       - name: Prepare module probe
-        if: inputs.test == 'core' || inputs.test == 'clash' || inputs.test == 'network' || inputs.test == 'routes'
+        if: contains(fromJSON('["core","clash","network","routes","core-config","core-constants","core-utils","core-async","clash-runtime","routes-panel"]'), inputs.test)
         env:
           DEBUG_TEST: ${{ inputs.test }}
         run: |

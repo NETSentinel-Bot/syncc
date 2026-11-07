@@ -84,19 +84,26 @@ jobs:
               worker="syncc-1101-debug-probe-routes"
               base64 -w0 index.html > src/panel.b64
               ;;
+            core-config|core-constants|core-utils|core-async|clash-runtime|routes-panel)
+              module="$DEBUG_TEST"
+              worker="syncc-1101-debug-$DEBUG_TEST"
+              if [ "$DEBUG_TEST" = "routes-panel" ]; then
+                base64 -w0 index.html > src/panel.b64
+              fi
+              ;;
             *)
               exit 1
               ;;
           esac
-
+          
           echo "PROBE_MODULE=$module" >> "$GITHUB_ENV"
           echo "PROBE_WORKER=$worker" >> "$GITHUB_ENV"
-
+          
           cat > wrangler.probe.debug.toml <<EOF
           name = "$worker"
           main = "debug/probe-$module.js"
           compatibility_date = "2025-09-01"
-
+          
           [[rules]]
           type = "Text"
           globs = ["**/*.b64"]
@@ -104,11 +111,11 @@ jobs:
           EOF
 
       - name: Bundle module probe
-        if: inputs.test == 'core' || inputs.test == 'clash' || inputs.test == 'network' || inputs.test == 'routes'
+        if: contains(fromJSON('["core","clash","network","routes","core-config","core-constants","core-utils","core-async","clash-runtime","routes-panel"]'), inputs.test)
         run: wrangler deploy --dry-run --outdir dist --config wrangler.probe.debug.toml
 
       - name: Deploy module probe
-        if: inputs.test == 'core' || inputs.test == 'clash' || inputs.test == 'network' || inputs.test == 'routes'
+        if: contains(fromJSON('["core","clash","network","routes","core-config","core-constants","core-utils","core-async","clash-runtime","routes-panel"]'), inputs.test)
         run: wrangler deploy "dist/probe-$PROBE_MODULE.js" --config wrangler.probe.debug.toml --name "$PROBE_WORKER"
 
       - name: Prepare source asset

@@ -22,6 +22,7 @@ on:
           - core-async
           - clash-runtime
           - routes-panel
+          - router
 
 permissions:
   contents: read
@@ -62,7 +63,7 @@ jobs:
         run: wrangler deploy --config wrangler.debug.toml
 
       - name: Prepare module probe
-        if: contains(fromJSON('["core","clash","network","routes","core-config","core-constants","core-utils","core-async","clash-runtime","routes-panel"]'), inputs.test)
+        if: contains(fromJSON('["core","clash","network","routes","core-config","core-constants","core-utils","core-async","clash-runtime","routes-panel","router"]'), inputs.test)
         env:
           DEBUG_TEST: ${{ inputs.test }}
         run: |
@@ -82,6 +83,11 @@ jobs:
             routes)
               module="routes"
               worker="syncc-1101-debug-probe-routes"
+              base64 -w0 index.html > src/panel.b64
+              ;;
+            router)
+              module="router"
+              worker="syncc-1101-debug-router"
               base64 -w0 index.html > src/panel.b64
               ;;
             core-config|core-constants|core-utils|core-async|clash-runtime|routes-panel)
@@ -111,11 +117,11 @@ jobs:
           EOF
 
       - name: Bundle module probe
-        if: contains(fromJSON('["core","clash","network","routes","core-config","core-constants","core-utils","core-async","clash-runtime","routes-panel"]'), inputs.test)
+        if: contains(fromJSON('["core","clash","network","routes","core-config","core-constants","core-utils","core-async","clash-runtime","routes-panel","router"]'), inputs.test)
         run: wrangler deploy --dry-run --outdir dist --config wrangler.debug.toml
 
       - name: Deploy module probe
-        if: contains(fromJSON('["core","clash","network","routes","core-config","core-constants","core-utils","core-async","clash-runtime","routes-panel"]'), inputs.test)
+        if: contains(fromJSON('["core","clash","network","routes","core-config","core-constants","core-utils","core-async","clash-runtime","routes-panel","router"]'), inputs.test)
         run: wrangler deploy "dist/probe-$PROBE_MODULE.js" --config wrangler.debug.toml --name "$PROBE_WORKER"
 
       - name: Prepare source asset

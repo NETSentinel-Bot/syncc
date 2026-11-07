@@ -13,22 +13,26 @@ export default {
     };
 
     const cases = [
-      ["root", "/"],
-      ["panel", `/${userID}`],
-      ["resolve-missing", "/resolve-domain"],
-      ["resolve-ipv4", "/resolve-domain?domain=1.1.1.1"],
-      ["proxy-host-info-missing", "/proxy-host-info"],
+      ["clash", `/clash/${userID}`],
+      ["xray", `/xray/${userID}`],
+      ["singbox", `/sb/${userID}`],
+      ["my-connection", "/my-connection"],
+      ["proxy-host-info", "/proxy-host-info?host=1.1.1.1"],
+      ["proxy-ips", `/proxy-ips/${userID}`],
     ];
 
     const results = [];
 
     for (const [name, path] of cases) {
+      const startedAt = performance.now();
+
       try {
         const response = await worker.fetch(
           new Request(new URL(path, base)),
           env,
           ctx,
         );
+
         const body = await response.text();
 
         results.push({
@@ -37,7 +41,7 @@ export default {
           status: response.status,
           contentType: response.headers.get("Content-Type"),
           bodyLength: body.length,
-          bodyPreview: body.length <= 160 ? body : undefined,
+          durationMs: Math.round(performance.now() - startedAt),
         });
       } catch (error) {
         results.push({
@@ -46,6 +50,7 @@ export default {
           errorName: error?.name,
           errorMessage: error?.message,
           stack: error?.stack,
+          durationMs: Math.round(performance.now() - startedAt),
         });
       }
     }
@@ -55,6 +60,7 @@ export default {
         success: results.every((result) => result.success),
         total: results.length,
         passed: results.filter((result) => result.success).length,
+        failed: results.filter((result) => !result.success).length,
         results,
       }),
       {

@@ -398,7 +398,14 @@ async function HandleTCPOutBound(
   }
 
   async function retryWithPool(pool, index) {
+    log("Retry pool entered", {
+      poolLength: pool.length,
+      index,
+    });
     if (index >= pool.length) {
+      log("Retry pool exhausted", {
+        poolLength: pool.length,
+      });
       await retryWithNAT64();
       return;
     }
@@ -425,6 +432,9 @@ async function HandleTCPOutBound(
   }
 
   async function retryWithNAT64() {
+    log("NAT64 fallback entered", {
+      enabled: config.nat64 !== false,
+    });
     if (config.nat64 === false) {
       safeCloseWebSocket(webSocket);
       return;
@@ -433,32 +443,47 @@ async function HandleTCPOutBound(
     const ipv4 = await resolveIPv4(addressRemote);
     const nat64Address = toNAT64Address(ipv4);
 
-    if (!nat64Address) {
-      log(`NAT64 fallback failed: could not resolve ${addressRemote}`);
-      safeCloseWebSocket(webSocket);
-      return;
-    }
+    
+async function retryWithNAT64() {
+  log("NAT64 fallback entered", {
+    enabled: config.nat64 !== false,
+  });
 
-    log(`falling back to NAT64: ${nat64Address}`);
-
-    try {
-      const tcpSocket = await connectAndWrite(nat64Address, portRemote);
-
-      RemoteSocketToWS(
-        tcpSocket,
-        webSocket,
-        protocolResponseHeader,
-        null,
-        log,
-      ).catch((error) => {
-        console.error("NAT64 RemoteSocketToWS failed:", error.stack || error);
-        safeCloseWebSocket(webSocket);
-      });
-    } catch (error) {
-      log("NAT64 connect failed", error);
-      safeCloseWebSocket(webSocket);
-    }
+  if (config.nat64 === false) {
+    log("NAT64 fallback disabled");
+    safeCloseWebSocket(webSocket);
+    return;
   }
+
+  const ipv4 = await resolveIPv4(addressRemote);
+  const nat64Address = toNAT64Address(ipv4);
+
+  if (!nat64Address) {
+    log(`NAT64 fallback failed: could not resolve ${addressRemote}`);
+    safeCloseWebSocket(webSocket);
+    return;
+  }
+
+  log(`falling back to NAT64: ${nat64Address}`);
+
+  try {
+    const tcpSocket = await connectAndWrite(nat64Address, portRemote);
+
+    RemoteSocketToWS(
+      tcpSocket,
+      webSocket,
+      protocolResponseHeader,
+      null,
+      log,
+    ).catch((error) => {
+      console.error("NAT64 RemoteSocketToWS failed:", error.stack || error);
+      safeCloseWebSocket(webSocket);
+    });
+  } catch (error) {
+    log("NAT64 connect failed", error);
+    safeCloseWebSocket(webSocket);
+  }
+}
 
   try {
     const tcpSocket = await connectAndWrite(addressRemote, portRemote);

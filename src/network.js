@@ -430,19 +430,6 @@ async function HandleTCPOutBound(
       await retryWithPool(pool, index + 1);
     }
   }
-
-  async function retryWithNAT64() {
-    log("NAT64 fallback entered", {
-      enabled: config.nat64 !== false,
-    });
-    if (config.nat64 === false) {
-      safeCloseWebSocket(webSocket);
-      return;
-    }
-
-    const ipv4 = await resolveIPv4(addressRemote);
-    const nat64Address = toNAT64Address(ipv4);
-
     
 async function retryWithNAT64() {
   log("NAT64 fallback entered", {

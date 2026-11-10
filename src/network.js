@@ -541,6 +541,7 @@ function MakeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
   });
 }
 
+
 async function RemoteSocketToWS(
   remoteSocket,
   webSocket,
@@ -570,22 +571,16 @@ async function RemoteSocketToWS(
 
           let dataToSend = chunk;
 
-          if (!hasIncomingData && retry) {
-            log("Retry started");
-          
-            try {
-              await retry();
-              log("Retry completed");
-            } catch (error) {
-              log("Retry failed", {
-                name: error?.name,
-                message: error?.message,
-                stack: error?.stack,
-              });
-              safeCloseWebSocket(webSocket);
-            }
-          
-            return;
+          if (!headerSent && protocolResponseHeader) {
+            const merged = new Uint8Array(
+              protocolResponseHeader.length + chunk.byteLength,
+            );
+
+            merged.set(protocolResponseHeader, 0);
+            merged.set(new Uint8Array(chunk), protocolResponseHeader.length);
+
+            dataToSend = merged.buffer;
+            headerSent = true;
           }
 
           webSocket.send(dataToSend);
@@ -624,12 +619,21 @@ async function RemoteSocketToWS(
   });
 
   if (!hasIncomingData && retry) {
+    log("Retry started");
+
     try {
       await retry();
+      log("Retry completed");
     } catch (error) {
-      console.error("retry failed:", error.stack || error);
+      log("Retry failed", {
+        name: error?.name,
+        message: error?.message,
+        stack: error?.stack,
+      });
+
       safeCloseWebSocket(webSocket);
     }
+
     return;
   }
 

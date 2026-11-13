@@ -4,9 +4,8 @@ import { connect } from "cloudflare:sockets";
 const TARGET_HOST = "13.62.228.245";
 const TARGET_PORT = 22;
 const READ_TIMEOUT_MS = 8000;
-const MAX_RESPONSE_BYTES = 32768;
+const MAX_RESPONSE_BYTES = 4096;
 
-const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 async function readWithTimeout(reader, timeoutMs) {
@@ -51,92 +50,17 @@ export default {
 
       await socket.opened;
       connectMs = Date.now() - startedAt;
-      stage = "read";
-      reader = socket.readable.getReader();
-      
-      const deadline = Date.now() + READ_TIMEOUT_MS;
-      const chunks = [];
-      
-      while (Date.now() < deadline && bytesReceived < 4096) {
-        const remaining = deadline - Date.now();
-        const result = await readWithTimeout(reader, remaining);
-      
-        if (result.timeout) {
-          readOutcome = "timeout";
-          break;
-        }
-      
-        if (result.done) {
-          readOutcome = "closed";
-          break;
-        }
-      
-        if (firstByteMs === null) {
-          firstByteMs = Date.now() - startedAt;
-        }
-      
-        bytesReceived += result.value.byteLength;
-        chunks.push(decoder.decode(result.value, { stream: true }));
-      
-        responseText = chunks.join("");
-      
-        if (responseText.includes("\n")) {
-          readOutcome = "data_received";
-          break;
-        }
-      }
-
-      stage = "write";
-      writer = socket.writable.getWriter();
-
-      const sshBanner = responseText.split("\r\n", 1)[0] || null;
-      const sshBannerReceived = /^SSH-\d+\.\d+-/.test(sshBanner ?? "");
-      
-      return Response.json(
-        {
-          success: sshBannerReceived,
-          target: `${TARGET_HOST}:${TARGET_PORT}`,
-          stage,
-          connectMs,
-          firstByteMs,
-          totalMs: Date.now() - startedAt,
-          bytesReceived,
-          readOutcome,
-          sshBanner,
-          error,
-        },
-        {
-          status: sshBannerReceived
-            ? 200
-            : readOutcome === "timeout"
-              ? 504
-              : 502,
-          headers: {
-            "Cache-Control": "no-store",
-          },
-        },
-      );
-
-      const writeStartedAt = Date.now();
-      await writer.write(payload);
-      writeMs = Date.now() - writeStartedAt;
-
-      writer.releaseLock();
-      writer = null;
 
       stage = "read";
       reader = socket.readable.getReader();
 
       const deadline = Date.now() + READ_TIMEOUT_MS;
 
-      while (bytesReceived < MAX_RESPONSE_BYTES) {
+      while (
+        Date.now() < deadline &&
+        bytesReceived < MAX_RESPONSE_BYTES
+      ) {
         const remaining = deadline - Date.now();
-
-        if (remaining <= 0) {
-          readOutcome = "timeout";
-          break;
-        }
-
         const result = await readWithTimeout(reader, remaining);
 
         if (result.timeout) {
@@ -156,10 +80,19 @@ export default {
         bytesReceived += result.value.byteLength;
         responseText += decoder.decode(result.value, { stream: true });
 
+        if (responseText.includes("\n")) {
+          readOutcome = "data_received";
+          break;
+        }
+
         if (bytesReceived >= MAX_RESPONSE_BYTES) {
           readOutcome = "max_bytes";
           break;
         }
+      }
+
+      if (readOutcome === "not_started") {
+        readOutcome = "timeout";
       }
     } catch (cause) {
       error = {
@@ -180,27 +113,24 @@ export default {
       }
     }
 
-    const httpStatusLine = responseText.split("\r\n", 1)[0] || null;
-    const httpResponseReceived =
-      /^HTTP\/1\.[01] \d{3}/.test(httpStatusLine ?? "");
+    const sshBanner = responseText.split(/\r?\n/, 1)[0] || null;
+    const sshBannerReceived = /^SSH-\d+\.\d+-/.test(sshBanner ?? "");
 
     return Response.json(
       {
-        success: httpResponseReceived,
+        success: sshBannerReceived,
         target: `${TARGET_HOST}:${TARGET_PORT}`,
         stage,
         connectMs,
-        writeMs,
         firstByteMs,
         totalMs: Date.now() - startedAt,
         bytesReceived,
         readOutcome,
-        httpStatusLine,
-        responsePreview: responseText.slice(0, 1200),
+        sshBanner,
         error,
       },
       {
-        status: httpResponseReceived
+        status: sshBannerReceived
           ? 200
           : readOutcome === "timeout"
             ? 504

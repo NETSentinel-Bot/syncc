@@ -24,6 +24,7 @@ on:
           - routes-panel
           - router
           - sockets
+          - tcp-probe
 
 permissions:
   contents: read
@@ -58,6 +59,10 @@ jobs:
 
       - name: Install Wrangler
         run: npm install --global wrangler@4.86.0
+
+      - name: Deploy independent TCP probe
+        if: inputs.test == 'tcp-probe'
+        run: wrangler deploy --config wrangler.tcp-probe.toml
 
       - name: Deploy baseline Worker
         if: inputs.test == 'baseline'

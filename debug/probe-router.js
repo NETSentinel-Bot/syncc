@@ -13,6 +13,8 @@ export default {
     };
 
     const cases = [
+      ["root", "/"],
+      ["panel", `/${userID}`],
       ["clash", `/clash/${userID}`],
       ["xray", `/xray/${userID}`],
       ["singbox", `/sb/${userID}`],

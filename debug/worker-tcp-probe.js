@@ -1,8 +1,8 @@
 
 import { connect } from "cloudflare:sockets";
 
-const TARGET_HOST = "example.com";
-const TARGET_PORT = 80;
+const TARGET_HOST = "13.62.228.245";
+const TARGET_PORT = 22;
 const READ_TIMEOUT_MS = 8000;
 const MAX_RESPONSE_BYTES = 32768;
 
@@ -33,11 +33,9 @@ export default {
     const startedAt = Date.now();
 
     let socket;
-    let writer;
     let reader;
     let stage = "connect";
     let connectMs = null;
-    let writeMs = null;
     let firstByteMs = null;
     let bytesReceived = 0;
     let responseText = "";
@@ -53,16 +51,70 @@ export default {
 
       await socket.opened;
       connectMs = Date.now() - startedAt;
+      stage = "read";
+      reader = socket.readable.getReader();
+      
+      const deadline = Date.now() + READ_TIMEOUT_MS;
+      const chunks = [];
+      
+      while (Date.now() < deadline && bytesReceived < 4096) {
+        const remaining = deadline - Date.now();
+        const result = await readWithTimeout(reader, remaining);
+      
+        if (result.timeout) {
+          readOutcome = "timeout";
+          break;
+        }
+      
+        if (result.done) {
+          readOutcome = "closed";
+          break;
+        }
+      
+        if (firstByteMs === null) {
+          firstByteMs = Date.now() - startedAt;
+        }
+      
+        bytesReceived += result.value.byteLength;
+        chunks.push(decoder.decode(result.value, { stream: true }));
+      
+        responseText = chunks.join("");
+      
+        if (responseText.includes("\n")) {
+          readOutcome = "data_received";
+          break;
+        }
+      }
 
       stage = "write";
       writer = socket.writable.getWriter();
 
-      const payload = encoder.encode(
-        "GET / HTTP/1.1\r\n" +
-        `Host: ${TARGET_HOST}\r\n` +
-        "User-Agent: syncc-tcp-probe\r\n" +
-        "Accept: */*\r\n" +
-        "Connection: close\r\n\r\n",
+      const sshBanner = responseText.split("\r\n", 1)[0] || null;
+      const sshBannerReceived = /^SSH-\d+\.\d+-/.test(sshBanner ?? "");
+      
+      return Response.json(
+        {
+          success: sshBannerReceived,
+          target: `${TARGET_HOST}:${TARGET_PORT}`,
+          stage,
+          connectMs,
+          firstByteMs,
+          totalMs: Date.now() - startedAt,
+          bytesReceived,
+          readOutcome,
+          sshBanner,
+          error,
+        },
+        {
+          status: sshBannerReceived
+            ? 200
+            : readOutcome === "timeout"
+              ? 504
+              : 502,
+          headers: {
+            "Cache-Control": "no-store",
+          },
+        },
       );
 
       const writeStartedAt = Date.now();
@@ -118,12 +170,6 @@ export default {
       if (reader) {
         try {
           await reader.cancel();
-        } catch {}
-      }
-
-      if (writer) {
-        try {
-          writer.releaseLock();
         } catch {}
       }
 

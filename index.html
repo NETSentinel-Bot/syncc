@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
     <meta name="theme-color" content="#0d1117" />
-    <title>Proxy Configuration Panel</title>
+    <title>Configuration Panel</title>
     <link rel="icon" href="https://pub-b3ab4c8172fb44e29854df3435aa223d.r2.dev/REvil.svg" type="image/svg" />
     <style>
       :root {
@@ -1981,7 +1981,7 @@
     <div class="container">
       <div class="header">
         <h1>VLESS Proxy Configuration</h1>
-        <p>Copy the configuration or import directly into your client</p>
+        <p>Copy the configuration or import it directly into your client.</p>
       </div>
 
       <div class="config-card">
@@ -2339,6 +2339,7 @@
     `;
             button.classList.add("copied");
             button.disabled = true;
+            if (typeof showCopyToast === "function") showCopyToast(["Copied!"]);
             setTimeout(() => {
               button.innerHTML = originalHTML;
               button.classList.remove("copied");
@@ -2355,6 +2356,7 @@
     `;
             button.classList.add("error");
             button.disabled = true;
+            if (typeof showCopyToast === "function") showCopyToast(["Copy failed"]);
             setTimeout(() => {
               button.innerHTML = originalHTMLError;
               button.classList.remove("error");
@@ -3486,6 +3488,11 @@
             button.classList.toggle("active", button.dataset.preset === "default");
           });
           refreshPattng(originalPattngRaw, pattngPre);
+        });
+        document.getElementById("xray-copy-btn")?.addEventListener("click", function() {
+          const configText = document.getElementById("xray-config")?.textContent?.trim() || "";
+          if (!configText) return;
+          copyToClipboard(this, configText);
         });
         document.getElementById("copy-pattng-btn")?.addEventListener("click", function() {
           copyToClipboard(this, pattngPre?.dataset.raw || "");

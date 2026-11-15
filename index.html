@@ -2417,7 +2417,6 @@
     `;
             button.classList.add("copied");
             button.disabled = true;
-            if (typeof showCopyToast === "function") showCopyToast(["Copied!"]);
             setTimeout(() => {
               button.innerHTML = originalHTML;
               button.classList.remove("copied");
@@ -2434,7 +2433,6 @@
     `;
             button.classList.add("error");
             button.disabled = true;
-            if (typeof showCopyToast === "function") showCopyToast(["Copy failed"]);
             setTimeout(() => {
               button.innerHTML = originalHTMLError;
               button.classList.remove("error");
